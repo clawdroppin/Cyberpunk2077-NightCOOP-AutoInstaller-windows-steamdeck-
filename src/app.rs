@@ -1378,7 +1378,7 @@ impl App {
                 "Remove everything",
                 format!(
                     "Uninstalls NightCoop and RED4ext{} so Cyberpunk is completely stock again. Your saves and the helper's backups stay.",
-                    if self.status.needs_launch_option() && self.status.launch_option_ok() {
+                    if self.status.needs_launch_option() && self.status.launch_option_any() {
                         if self.status.steam_running { " and removes the Steam launch option (Steam restarts)" } else { " and removes the Steam launch option" }
                     } else {
                         ""
@@ -1449,7 +1449,7 @@ impl App {
             }
             Confirm::RemoveAll => {
                 if let Some(g) = game {
-                    let launch_option = self.status.needs_launch_option() && self.status.launch_option_ok();
+                    let launch_option = self.status.needs_launch_option() && self.status.launch_option_any();
                     self.spawn(ctx, "Removing everything", move |rep, state, _| {
                         if g.plugin_dir().exists() || g.disabled_plugin_dir().exists() || g.park_dir().exists() {
                             ops::uninstall_nightcoop(&g, state, rep)?;

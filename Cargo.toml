@@ -1,6 +1,6 @@
 [package]
 name = "nightcoop-helper"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Installs and updates the NightCoop co-op mod for Cyberpunk 2077 (Steam Deck, Linux, Windows)"
 repository = "https://github.com/clawdroppin/Cyberpunk2077-NightCOOP-AutoInstaller-windows-steamdeck-"

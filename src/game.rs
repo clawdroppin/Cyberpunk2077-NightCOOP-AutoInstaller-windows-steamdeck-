@@ -223,6 +223,11 @@ impl Status {
         !self.users.is_empty() && self.users.iter().all(|u| u.launch_options.as_deref().map(steam::has_override).unwrap_or(false))
     }
 
+    /// At least one Steam account on this device still has the override (what removal must clean up).
+    pub fn launch_option_any(&self) -> bool {
+        self.users.iter().any(|u| u.launch_options.as_deref().map(steam::has_override).unwrap_or(false))
+    }
+
     pub fn needs_launch_option(&self) -> bool {
         self.game.as_ref().map(|g| g.uses_proton()).unwrap_or(false)
     }

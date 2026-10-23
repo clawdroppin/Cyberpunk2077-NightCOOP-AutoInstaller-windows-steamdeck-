@@ -128,6 +128,8 @@ print([t.needed for s in f.iter_sections() if s.name == ".dynamic" for t in s.it
 
 ## Changelog
 
+- **0.3.1** — "Remove everything" clears the Proton launch option when *any* Steam account on the device has it
+  (it used to require every account, so a Deck with two accounts could keep it).
 - **0.3.0** — Tuned to the real NightCoop 0.1.0-beta.1: RED4ext bundled with NightCoop is the default (with a
   "My own version" choice that updates never override), one-click setup installs the build directly (GitHub RED4ext only as
   fallback), semver pre-release ordering, protocol number in "Copy my versions"/partner compare, game-version support
