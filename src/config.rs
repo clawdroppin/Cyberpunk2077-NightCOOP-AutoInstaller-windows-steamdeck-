@@ -103,6 +103,10 @@ pub struct InstallState {
     pub game_dir: String,
     pub red4ext_version: Option<String>,
     pub red4ext_files: Vec<String>,
+    /// The player picked their own RED4ext; NightCoop installs must leave it alone.
+    pub red4ext_custom: bool,
+    /// RED4ext version shipped inside the installed NightCoop build.
+    pub red4ext_bundled: Option<String>,
     pub nightcoop_version: Option<String>,
     pub nightcoop_sha256: Option<String>,
     pub nightcoop_dll_sha256: Option<String>,

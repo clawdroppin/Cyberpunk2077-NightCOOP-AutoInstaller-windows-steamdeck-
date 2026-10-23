@@ -32,8 +32,8 @@ Getting a RED4ext mod running on the Steam Deck normally means Desktop Mode, dig
 | | Step | What happens |
 |---|---|---|
 | 💾 | **Backs up your saves** | Zips your saves first (on the Deck it finds them inside the Proton prefix). |
-| 🧩 | **Installs RED4ext** | Latest release from GitHub, checksum-verified, dropped into the right folders. |
-| 🌃 | **Installs NightCoop** | Latest build from the official release list, checksum-verified, mirrors as fallback. |
+| 🌃 | **Installs NightCoop** | Latest build from the official release list on nightcoop.net, checksum-verified. |
+| 🧩 | **Sets up RED4ext** | Uses the RED4ext that ships inside the NightCoop build (the pair its authors tested). GitHub is only a fallback. |
 | 🐧 | **Fixes Proton** *(Deck/Linux)* | Adds `WINEDLLOVERRIDES="winmm,version=n,b" %command%` to Steam's launch options, keeping anything you already had. |
 | ✅ | **Checks it all** | Green ticks when everything is ready to play. |
 
@@ -41,13 +41,16 @@ Press the same button again whenever an update is out — it only replaces what 
 
 ### And a lot more
 
-- 🔄 **Update checks** for RED4ext, NightCoop (stable or beta channel) and the helper itself
-- 📦 **Version picker** — install any listed NightCoop build or RED4ext release, with notes, game versions and protocol numbers
+- 🔄 **Update checks** for NightCoop (stable or beta channel), RED4ext and the helper itself
+- 📦 **Version picker** — install any listed NightCoop build, with notes, supported game versions, protocol and build numbers
+- 🧩 **RED4ext your way** — *Bundled with NightCoop* (default, kept matched on every update) or *My own version* (pick any RED4ext release; updates never override it)
+- ✅ **Game-version check** — shows whether the installed build supports your Cyberpunk version
+- 🗑 **Remove everything** — uninstalls NightCoop, RED4ext and the launch option in one go
 - ⏪ **One-click rollback** to your previous NightCoop build (last 3 kept)
 - 📂 **Install from file** — `.zip` / `.7z` builds shared on Discord, even with an extra wrapper folder
 - 🔌 **Mods off / on** — one tap on Home for an unmodded game; everything is kept and the helper offers to turn mods back on whenever you open it again
 - ⚠ **Game-update alert** — warns when a Cyberpunk patch arrived after the mods were installed (the usual reason mods suddenly stop working)
-- 👥 **Compare with my partner** — paste their versions and see ✔/✖ for NightCoop, RED4ext, game and Phantom Liberty
+- 👥 **Compare with my partner** — paste their versions and see ✔/✖ for NightCoop, protocol, RED4ext, game and Phantom Liberty
 - 🌐 **Keeps your `servers.txt`** across updates; view, edit and copy it
 - 🐞 **Bug report zip** — RED4ext + NightCoop logs and a diagnostics summary in one file
 - 📋 **Copy my versions** — paste to your partner to confirm you run the same build
@@ -147,7 +150,7 @@ That happens in Gaming Mode. Switch to Desktop Mode and press the button again, 
 | Steam launch-option backups | `NightCoopHelper-data/backups/steam-localconfig/` |
 | Bug reports | your Desktop |
 
-**Uninstalling:** 📦 Mods & Versions → *Uninstall* for NightCoop and RED4ext, and *Remove* for the launch option. Then delete the helper folder. Your saves are never deleted.
+**Uninstalling:** 📦 Mods & Versions → **🗑 Remove everything** uninstalls NightCoop and RED4ext and removes the launch option in one go (or use the individual *Uninstall* buttons). Then delete the helper folder. Your saves are never deleted.
 
 ## 🔒 Safety
 

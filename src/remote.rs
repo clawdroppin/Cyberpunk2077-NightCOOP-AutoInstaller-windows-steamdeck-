@@ -89,6 +89,8 @@ pub struct NcRelease {
     pub notes: Value,
     pub game: Vec<String>,
     pub protocol: Value,
+    /// Source revision of the build, e.g. "a7c537d".
+    pub build: Option<String>,
     pub files: Vec<NcFile>,
 }
 

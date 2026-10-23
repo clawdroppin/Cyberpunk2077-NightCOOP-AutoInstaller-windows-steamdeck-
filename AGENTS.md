@@ -66,7 +66,7 @@ one-button flow working without a terminal.
 
 ```powershell
 cargo test                      # unit + fake-game install cycle (no network)
-cargo test -- --ignored         # also downloads real RED4ext into a temp folder
+cargo test -- --include-ignored # also installs real RED4ext and the live NightCoop build into temp folders
 cargo run                       # debug GUI
 $env:NCH_PAGE="versions"; cargo run   # open a page directly: home, versions, saves, servers, troubleshoot, guide, settings
 .\build.ps1                     # full release build into dist\
@@ -96,26 +96,42 @@ print([t.needed for s in f.iter_sections() if s.name == ".dynamic" for t in s.it
    The self-updater picks the asset containing `windows` + `.exe`, or `linux` without an archive extension,
    and the README links use `/releases/latest/download/<name>` — **don't rename them**.
 
-## Open items / next big update (after the NightCoop open beta goes live)
+## What the real NightCoop builds look like (verified on 0.1.0-beta.1)
 
-The helper was written on release day, before any NightCoop build existed (`releases.json` had `releases: []`).
-When the first build is published, verify and adjust:
+- Feed entry: `version: "0.1.0-beta.1"`, `channel: "beta"`, `game: ["2.5", "2.31"]`, `protocol: 128`, `build: "a7c537d"`,
+  one `files` entry `{kind: "mod", name, url: "dl/<ver>/NightCoop-<ver>.zip" (relative), size, sha256}`, `yanked: null`.
+  While only betas exist, the **stable** channel falls back to the site's `latest` (see `NcManifest::latest_for`).
+- Zip layout: `bin/x64/winmm.dll`, `red4ext/RED4ext.dll` + licenses, `red4ext/plugins/NightCoop/NightCoop.dll`.
+  Nothing outside `bin/` and `red4ext/`, so Mods off covers everything.
+- **RED4ext is bundled** (1.30.0, byte-identical to GitHub's). The site says: "RED4ext 1.30 is already in the archive —
+  nothing to install on its own." Policy (`InstallState.red4ext_custom`):
+  - default **Bundled**: every NightCoop install makes RED4ext match the build's copy (`ops::install_bundled_red4ext`);
+    "Install everything" also reinstalls the build (from the checksum-matched cache) if RED4ext drifted.
+  - **My own version**: set when the player installs a RED4ext release/file from Mods & Versions; NightCoop installs then
+    never touch RED4ext. Switching back to Bundled reinstalls the current build to restore its RED4ext.
+  - GitHub RED4ext is only a fallback (no build listed / feed down) and an informational "newer on GitHub" note.
+- `NightCoop.dll` has **no version resource**, so the installed version is known only from `InstallState` (trusted while the
+  DLL's SHA-256 matches). A build installed outside the helper shows "unknown version" and is offered as an update.
+- Versions use semver pre-releases: `0.1.0` > `0.1.0-beta.2` > `0.1.0-beta.1` (`util::cmp_versions`).
+- `game` entries are matched against the exe's ProductVersion (`2.5` here) with `util::version_covers`.
 
-- [ ] Real `releases.json` entry parses (`remote::NcManifest`), `latest_for()` picks the right build on both channels.
-- [ ] Real archive layout installs cleanly (`ops::install_nightcoop_archive` finds `red4ext/…/NightCoop.dll`;
-      check whether the build ships extra root folders like `archive/` or `r6/`).
-- [ ] Version shown for an installed build: we trust our record when the DLL hash matches, else PE version — confirm the DLL carries a sensible version resource.
-- [ ] `game: [...]` format vs. our game-version display (`util::pe_version` on `Cyberpunk2077.exe` gives e.g. `2.5`) — consider warning on a mismatch.
+`cargo test -- --include-ignored` runs `real_nightcoop_install`, which installs the live latest build into a temp folder.
+
+## Open items
+
 - [ ] On the Deck: full "Install everything" from Desktop Mode, Steam restart, launch option written, game shows the Co-op menu.
 - [ ] "Add to Steam" shortcut appears in Gaming Mode and launches.
 - [ ] File picker (xdg-desktop-portal) works in Desktop Mode.
-- [ ] Remove the "open beta 23 October" hint on Home once builds exist (it only shows while the list is empty).
-- [ ] Confirm the real NightCoop build doesn't need anything outside `red4ext/` (Mods off only parks RED4ext's files).
+- [ ] NightCoop officially supports Windows 10/11 only; collect Deck/Proton reports.
 - Ideas: Windows exe/window icon, Proton version recommendation, detect Heroic/Lutris installs on Linux,
-  controller-friendly focus navigation for Gaming Mode.
+  controller-friendly focus navigation for Gaming Mode, identify manually installed builds by hashing the DLL inside cached zips.
 
 ## Changelog
 
+- **0.3.0** — Tuned to the real NightCoop 0.1.0-beta.1: RED4ext bundled with NightCoop is the default (with a
+  "My own version" choice that updates never override), one-click setup installs the build directly (GitHub RED4ext only as
+  fallback), semver pre-release ordering, protocol number in "Copy my versions"/partner compare, game-version support
+  check on Home, Remove everything button, build id shown, "vX available" on Home.
 - **0.2.0** — Mods off/on switch (survives restarts), game-update alert, partner version compare, Steam Cloud status,
   extra backup folder + export, safer restore (folder swap; can't prune the backup being restored), download cache pruning,
   no more `panic = "abort"` (a failing job shows an error instead of closing the app), fewer per-frame disk/process scans.

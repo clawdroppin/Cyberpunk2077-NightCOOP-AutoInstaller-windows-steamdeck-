@@ -191,12 +191,18 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
-/// Compares versions like "1.30.0", "v1.2.3-beta.4" by their numeric parts.
+/// Compares versions like "1.30.0", "v1.2.3" or "0.1.0-beta.1". Numeric parts are compared
+/// first; on a tie a pre-release ("-beta.1") is older than the release itself, as in semver.
 pub fn cmp_versions(a: &str, b: &str) -> Ordering {
-    let nums = |s: &str| -> Vec<u64> {
-        s.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty()).filter_map(|p| p.parse().ok()).collect()
-    };
-    let (na, nb) = (nums(a), nums(b));
+    fn split(s: &str) -> (Vec<u64>, Option<&str>) {
+        let s = s.trim().trim_start_matches(['v', 'V']);
+        let (core, pre) = match s.find('-') {
+            Some(i) => (&s[..i], Some(&s[i + 1..])),
+            None => (s, None),
+        };
+        (version_numbers(core), pre.filter(|p| !p.is_empty()))
+    }
+    let ((na, pa), (nb, pb)) = (split(a), split(b));
     for i in 0..na.len().max(nb.len()) {
         let (x, y) = (na.get(i).copied().unwrap_or(0), nb.get(i).copied().unwrap_or(0));
         match x.cmp(&y) {
@@ -204,7 +210,29 @@ pub fn cmp_versions(a: &str, b: &str) -> Ordering {
             o => return o,
         }
     }
-    Ordering::Equal
+    match (pa, pb) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => {
+            let (ix, iy): (Vec<&str>, Vec<&str>) = (x.split('.').collect(), y.split('.').collect());
+            for i in 0..ix.len().max(iy.len()) {
+                let o = match (ix.get(i), iy.get(i)) {
+                    (Some(p), Some(q)) => match (p.parse::<u64>(), q.parse::<u64>()) {
+                        (Ok(m), Ok(n)) => m.cmp(&n),
+                        _ => p.to_ascii_lowercase().cmp(&q.to_ascii_lowercase()),
+                    },
+                    (Some(_), None) => Ordering::Greater,
+                    (None, Some(_)) => Ordering::Less,
+                    (None, None) => Ordering::Equal,
+                };
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            Ordering::Equal
+        }
+    }
 }
 
 pub fn same_version(a: &str, b: &str) -> bool {
@@ -265,6 +293,13 @@ mod tests {
         assert_eq!(cmp_versions("v1.30.0", "1.29.9"), Ordering::Greater);
         assert_eq!(cmp_versions("1.2", "1.2.0"), Ordering::Equal);
         assert_eq!(cmp_versions("0.9.10", "0.9.9"), Ordering::Greater);
+        assert_eq!(cmp_versions("0.1.0", "0.1.0-beta.1"), Ordering::Greater);
+        assert_eq!(cmp_versions("0.1.0-beta.2", "0.1.0-beta.1"), Ordering::Greater);
+        assert_eq!(cmp_versions("0.1.0-rc.1", "0.1.0-beta.9"), Ordering::Greater);
+        assert_eq!(cmp_versions("0.1.1-beta.1", "0.1.0"), Ordering::Greater);
+        assert!(same_version("v0.1.0-beta.1", "0.1.0-beta.1"));
+        assert!(same_version("1.30.0.0", "1.30.0"));
+        assert!(!same_version("0.1.0", "0.1.0-beta.1"));
         assert!(version_covers("2.3", "2.3.1"));
         assert!(version_covers("2.31", "2.31"));
         assert!(!version_covers("2.3", "2.5"));

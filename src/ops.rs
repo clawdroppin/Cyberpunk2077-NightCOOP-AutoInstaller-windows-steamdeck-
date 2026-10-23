@@ -250,6 +250,13 @@ pub fn restore_saves(game: &Game, settings: &Settings, state: &mut InstallState,
 
 // ---------- RED4ext ----------
 
+/// Version of the RED4ext currently in the game, if both its files are present.
+pub fn installed_red4ext(game: &Game) -> Option<String> {
+    let loader = game.dir.join("bin").join("x64").join("winmm.dll");
+    let dll = game.red4ext_dir().join("RED4ext.dll");
+    (loader.is_file() && dll.is_file()).then(|| util::pe_version(&dll).unwrap_or_else(|| "unknown".into()))
+}
+
 pub fn install_red4ext_release(game: &Game, rel: &GhRelease, state: &mut InstallState, rep: &Reporter) -> Result<()> {
     let asset = remote::red4ext_asset(rel).ok_or_else(|| anyhow!("RED4ext {} has no zip download", rel.tag_name))?;
     let file = config::sub("downloads").join(&asset.name);
@@ -307,6 +314,7 @@ pub fn uninstall_red4ext(game: &Game, state: &mut InstallState, rep: &Reporter) 
     }
     state.red4ext_version = None;
     state.red4ext_files.clear();
+    state.red4ext_custom = false;
     rep.log("RED4ext removed.");
     Ok(())
 }
@@ -383,11 +391,17 @@ pub fn install_nightcoop_archive(
     // Work out where the plugin lives in the archive.
     let plugin_src: PathBuf;
     let mut extra_roots: Vec<PathBuf> = Vec::new();
+    let mut bundle_root: Option<PathBuf> = None;
     if let Some(root) = find_red4ext_root(&stage, 3) {
         let dll = find_file(&root.join("red4ext"), "NightCoop.dll", 3).ok_or_else(|| anyhow!("NightCoop.dll not found in the archive's red4ext folder"))?;
         plugin_src = dll.parent().unwrap().to_path_buf();
+        // Builds ship the RED4ext they were tested with (bin/x64/winmm.dll + red4ext/RED4ext.dll).
+        if root.join("red4ext").join("RED4ext.dll").is_file() && root.join("bin").join("x64").join("winmm.dll").is_file() {
+            bundle_root = Some(root.clone());
+        }
         // Other game-root folders shipped next to red4ext (archive mods, scripts…).
-        for name in ["archive", "bin", "r6", "engine", "mods"] {
+        // `bin` is left out: the loader in it is handled with the bundled RED4ext.
+        for name in ["archive", "r6", "engine", "mods"] {
             let p = root.join(name);
             if p.is_dir() {
                 extra_roots.push(p);
@@ -435,6 +449,9 @@ pub fn install_nightcoop_archive(
     for (name, bytes) in &kept {
         fs::write(dest.join(name), bytes)?;
     }
+    if let Some(root) = &bundle_root {
+        install_bundled_red4ext(game, root, state, rep)?;
+    }
     let _ = fs::remove_dir_all(&stage);
 
     let dll = dest.join("NightCoop.dll");
@@ -451,6 +468,40 @@ pub fn install_nightcoop_archive(
     state.installed_at = Some(util::timestamp());
     state.game_build_id = game.steam.as_ref().and_then(|g| g.build_id.clone());
     rep.log(format!("NightCoop {version} installed ({n} files){}.", if kept.is_empty() { "" } else { ", your servers.txt was kept" }));
+    Ok(())
+}
+
+/// Keeps RED4ext matched to the one shipped inside the NightCoop build (the tested pair),
+/// unless the player chose their own version.
+fn install_bundled_red4ext(game: &Game, root: &Path, state: &mut InstallState, rep: &Reporter) -> Result<()> {
+    let bundled = util::pe_version(&root.join("red4ext").join("RED4ext.dll")).unwrap_or_else(|| "0".into());
+    state.red4ext_bundled = Some(bundled.clone());
+    let loader = game.dir.join("bin").join("x64").join("winmm.dll");
+    let installed = installed_red4ext(game);
+    if let Some(cur) = &installed {
+        if state.red4ext_custom {
+            rep.log(format!("Keeping your chosen RED4ext {cur} (the build ships {bundled})."));
+            return Ok(());
+        }
+        if util::same_version(&bundled, cur) {
+            rep.log(format!("RED4ext {cur} matches the build."));
+            return Ok(());
+        }
+    }
+    let mut files = Vec::new();
+    fs::create_dir_all(loader.parent().unwrap())?;
+    fs::copy(root.join("bin").join("x64").join("winmm.dll"), &loader).with_context(|| format!("cannot write {}", loader.display()))?;
+    files.push("bin/x64/winmm.dll".to_string());
+    for e in fs::read_dir(root.join("red4ext"))?.flatten() {
+        if e.path().is_file() {
+            let name = e.file_name();
+            fs::copy(e.path(), game.red4ext_dir().join(&name))?;
+            files.push(format!("red4ext/{}", name.to_string_lossy()));
+        }
+    }
+    state.red4ext_version = Some(bundled.clone());
+    state.red4ext_files = files;
+    rep.log(format!("RED4ext {bundled} installed from the NightCoop build."));
     Ok(())
 }
 
@@ -694,6 +745,44 @@ mod tests {
         assert_eq!(util::pe_version(&game_dir.join("red4ext/RED4ext.dll")).map(|v| util::same_version(&v, &rel.version())), Some(true));
         let m = remote::nightcoop_manifest(remote::NIGHTCOOP_MANIFEST).unwrap();
         println!("nightcoop releases: {}", m.releases.len());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[ignore = "downloads the real NightCoop build"]
+    fn real_nightcoop_install() {
+        let root = std::env::temp_dir().join(format!("nchelper-nc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let game_dir = root.join("Cyberpunk 2077");
+        fs::create_dir_all(game_dir.join("bin/x64")).unwrap();
+        fs::write(game_dir.join("bin/x64/Cyberpunk2077.exe"), b"MZ").unwrap();
+        let game = Game { dir: game_dir.clone(), store: Store::Manual, steam: None };
+        let m = remote::nightcoop_manifest(remote::NIGHTCOOP_MANIFEST).unwrap();
+        // Only betas exist so far: the stable channel must still find the site's latest.
+        let rel = m.latest_for(crate::config::Channel::Stable).expect("a build").clone();
+        assert_eq!(m.latest_for(crate::config::Channel::Beta).unwrap().version, rel.version);
+        println!("latest: {} game {:?} protocol {:?}", rel.version, rel.game, rel.protocol_str());
+        let mut state = InstallState::default();
+        install_nightcoop_release(&game, &rel, remote::NIGHTCOOP_MANIFEST, &mut state, &reporter()).unwrap();
+        assert!(game.plugin_dir().join("NightCoop.dll").is_file());
+        // The build bundles RED4ext; with none installed it must be put in place.
+        assert!(game_dir.join("bin/x64/winmm.dll").is_file() && game.red4ext_dir().join("RED4ext.dll").is_file());
+        assert!(state.red4ext_version.as_deref().map(|v| util::cmp_versions(v, "1.30").is_ge()).unwrap_or(false));
+        let settings = Settings { game_path: game_dir.display().to_string(), ..Settings::default() };
+        let st = crate::game::Status::scan(&settings, &state);
+        assert_eq!(st.nightcoop_version.as_deref(), Some(rel.version.as_str()));
+        assert!(st.loader_present && st.red4ext_version.is_some());
+        assert_eq!(state.red4ext_bundled, state.red4ext_version);
+
+        // "My own version": NightCoop updates must leave a chosen RED4ext alone…
+        fs::write(game.red4ext_dir().join("RED4ext.dll"), b"custom").unwrap();
+        state.red4ext_custom = true;
+        install_nightcoop_release(&game, &rel, remote::NIGHTCOOP_MANIFEST, &mut state, &reporter()).unwrap();
+        assert_eq!(fs::read(game.red4ext_dir().join("RED4ext.dll")).unwrap(), b"custom");
+        // …and "Bundled" puts the build's own RED4ext back (from the cached, checksum-matched download).
+        state.red4ext_custom = false;
+        install_nightcoop_release(&game, &rel, remote::NIGHTCOOP_MANIFEST, &mut state, &reporter()).unwrap();
+        assert_ne!(fs::read(game.red4ext_dir().join("RED4ext.dll")).unwrap(), b"custom");
         let _ = fs::remove_dir_all(&root);
     }
 }

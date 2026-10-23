@@ -79,6 +79,7 @@ enum Confirm {
     DeleteBackup(PathBuf),
     UninstallNightCoop,
     UninstallRed4ext,
+    RemoveAll,
     AddToSteam,
     InstallNcVersion(String),
     InstallR4Version(usize),
@@ -277,7 +278,9 @@ impl App {
         }
     }
 
-    fn r4_update_available(&self) -> bool {
+    /// GitHub has a newer RED4ext than the installed one. Informational only: NightCoop builds
+    /// ship the RED4ext they were tested with, so setup doesn't chase newer releases.
+    fn r4_newer_on_github(&self) -> bool {
         match (self.r4_latest(), &self.status.red4ext_version) {
             (Some(l), Some(cur)) => cur.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && util::cmp_versions(&l.version(), cur).is_gt(),
             _ => false,
@@ -291,10 +294,20 @@ impl App {
         }
     }
 
+    /// The manifest entry for the installed NightCoop build, if it's listed.
+    fn installed_release(&self) -> Option<&remote::NcRelease> {
+        let v = self.status.nightcoop_version.as_deref()?;
+        match &self.remote.nightcoop {
+            Some(Ok(m)) => m.releases.iter().find(|r| util::same_version(&r.version, v)),
+            _ => None,
+        }
+    }
+
     fn share_text(&self) -> String {
         let s = &self.status;
+        let protocol = self.installed_release().and_then(|r| r.protocol_str()).map(|p| format!(" · Protocol {p}")).unwrap_or_default();
         format!(
-            "NightCoop {} · RED4ext {} · Game {} · Phantom Liberty: {}",
+            "NightCoop {}{protocol} · RED4ext {} · Game {} · Phantom Liberty: {}",
             s.nightcoop_version.as_deref().unwrap_or("not installed"),
             s.red4ext_version.as_deref().unwrap_or("not installed"),
             s.game_version.as_deref().unwrap_or("?"),
@@ -307,7 +320,6 @@ impl App {
     fn start_setup(&mut self, ctx: &egui::Context, restart_steam: bool) {
         let Some(game) = self.status.game.clone() else { return };
         let needs_lo = self.status.needs_launch_option() && !self.status.launch_option_ok();
-        let r4_installed = self.status.red4ext_version.is_some() && self.status.loader_present;
         let nc_installed_version = self.status.nightcoop_version.clone().filter(|_| self.status.nightcoop_installed);
         let nc_disabled = self.status.nightcoop_disabled;
         self.spawn(ctx, "Install / update everything", move |rep, state, settings| {
@@ -324,46 +336,40 @@ impl App {
                 ops::backup_saves(&game, settings, state, rep, "before-install")?;
             }
 
-            // RED4ext
-            let r4 = match &info.red4ext {
-                Some(Ok(list)) => list.iter().find(|r| !r.prerelease && remote::red4ext_asset(r).is_some()).cloned(),
-                Some(Err(e)) => {
-                    rep.log(format!("Could not check RED4ext releases: {e}"));
-                    None
-                }
-                None => None,
-            };
-            match (&r4, r4_installed) {
-                (Some(rel), false) => ops::install_red4ext_release(&game, rel, state, rep)?,
-                (Some(rel), true) => {
-                    let cur = util::pe_version(&game.red4ext_dir().join("RED4ext.dll")).or(state.red4ext_version.clone()).unwrap_or_default();
-                    if util::cmp_versions(&rel.version(), &cur).is_gt() {
-                        ops::install_red4ext_release(&game, rel, state, rep)?;
-                    } else {
-                        rep.log(format!("RED4ext {cur} is up to date."));
-                    }
-                }
-                (None, false) => return Err(anyhow!("RED4ext is not installed and could not be downloaded")),
-                (None, true) => {}
-            }
-
-            // NightCoop
+            // NightCoop first: each build ships the RED4ext it was tested with.
             if nc_disabled {
                 ops::set_nightcoop_enabled(&game, true, rep)?;
             }
+            let loader_ok = |g: &game::Game| g.dir.join("bin").join("x64").join("winmm.dll").is_file() && g.red4ext_dir().join("RED4ext.dll").is_file();
             match &info.nightcoop {
                 Some(Ok(m)) => match m.latest_for(settings.channel) {
                     Some(rel) => {
-                        if nc_installed_version.as_deref().map(|v| util::same_version(v, &rel.version)).unwrap_or(false) {
+                        let current = nc_installed_version.as_deref().map(|v| util::same_version(v, &rel.version)).unwrap_or(false);
+                        // With the bundled choice, RED4ext must match what the build ships.
+                        let r4_matches = state.red4ext_custom
+                            || matches!((&state.red4ext_bundled, ops::installed_red4ext(&game)), (Some(b), Some(i)) if util::same_version(b, &i));
+                        if current && loader_ok(&game) && r4_matches {
                             rep.log(format!("NightCoop {} is up to date.", rel.version));
                         } else {
                             ops::install_nightcoop_release(&game, rel, &settings.manifest_url, state, rep)?;
                         }
                     }
-                    None => rep.log("NightCoop has no downloadable build yet. Check again once it's released (or use “Install from file”)."),
+                    None => rep.log("NightCoop has no downloadable build yet. Check again later (or use “Install from file”)."),
                 },
                 Some(Err(e)) => rep.log(format!("Could not check NightCoop releases: {e}")),
                 None => {}
+            }
+
+            // Fallback: RED4ext from GitHub when no NightCoop build provided it.
+            if !loader_ok(&game) {
+                let r4 = match &info.red4ext {
+                    Some(Ok(list)) => list.iter().find(|r| !r.prerelease && remote::red4ext_asset(r).is_some()).cloned(),
+                    _ => None,
+                };
+                match r4 {
+                    Some(rel) => ops::install_red4ext_release(&game, &rel, state, rep)?,
+                    None => return Err(anyhow!("RED4ext could not be downloaded. Check the internet connection and try again.")),
+                }
             }
 
             // Proton launch option
@@ -378,6 +384,32 @@ impl App {
             state.game_build_id = game.steam.as_ref().and_then(|g| g.build_id.clone());
             Ok(Extra::Remote(info))
         });
+    }
+
+    /// Switches back to the RED4ext shipped with NightCoop and puts it in place now when possible.
+    fn use_bundled_red4ext(&mut self, ctx: &egui::Context, game: &game::Game) {
+        self.state.red4ext_custom = false;
+        self.state.save();
+        let rel = match &self.remote.nightcoop {
+            Some(Ok(m)) => self
+                .status
+                .nightcoop_version
+                .as_deref()
+                .and_then(|v| m.releases.iter().find(|r| util::same_version(&r.version, v)))
+                .or_else(|| m.latest_for(self.settings.channel))
+                .cloned(),
+            _ => None,
+        };
+        match rel {
+            Some(rel) if self.status.nightcoop_installed => {
+                let g = game.clone();
+                self.spawn(ctx, "Restoring the bundled RED4ext", move |rep, state, settings| {
+                    state.red4ext_custom = false;
+                    ops::install_nightcoop_release(&g, &rel, &settings.manifest_url, state, rep).map(|_| Extra::None)
+                });
+            }
+            _ => self.banner = Some((true, "Bundled RED4ext selected — it's installed with NightCoop on the next “Install everything”.".into())),
+        }
     }
 
     fn request_setup(&mut self, ctx: &egui::Context) {
@@ -539,12 +571,12 @@ impl App {
                 None => check_row(ui, Some(false), "Cyberpunk 2077", "not found — set the game folder in Settings"),
             }
             let r4_detail = match (&s.red4ext_version, s.loader_present) {
-                (Some(v), true) if self.r4_update_available() => format!("{v} → update to {} available", self.r4_latest().unwrap().version()),
-                (Some(v), true) => format!("{v}"),
+                (Some(v), true) if self.r4_newer_on_github() => format!("{v} · {} on GitHub (optional, Mods & Versions)", self.r4_latest().unwrap().version()),
+                (Some(v), true) => format!("{v}{}", if self.state.red4ext_custom { " · your choice" } else if self.state.red4ext_bundled.is_some() { " · bundled with NightCoop" } else { "" }),
                 (Some(_), false) => "loader (bin/x64/winmm.dll) missing — reinstall".into(),
                 (None, _) => "not installed".into(),
             };
-            let r4_ok = if s.red4ext_version.is_some() && s.loader_present { Some(true).filter(|_| !self.r4_update_available()).or(None) } else { Some(false) };
+            let r4_ok = Some(s.red4ext_version.is_some() && s.loader_present);
             check_row(ui, r4_ok, "RED4ext (mod loader)", &r4_detail);
 
             let nc_detail = if s.mods_off && s.nightcoop_installed {
@@ -556,13 +588,25 @@ impl App {
                     (Some(v), true) if self.nc_update_available() => format!("{v} → {} available", self.nc_latest().unwrap().version),
                     (Some(v), true) => v.clone(),
                     _ => match (&self.remote.nightcoop, self.nc_latest()) {
-                        (Some(Ok(_)), None) => "not installed — no public build yet".into(),
+                        (_, Some(l)) => format!("not installed — v{} available", l.version),
+                        (Some(Ok(_)), None) => "not installed — no build listed yet".into(),
                         _ => "not installed".into(),
                     },
                 }
             };
             let nc_ok = if s.nightcoop_installed { if self.nc_update_available() { None } else { Some(true) } } else { Some(false) };
             check_row(ui, nc_ok, "NightCoop", &nc_detail);
+            if let (Some(rel), Some(gv)) = (self.installed_release(), &s.game_version) {
+                if !rel.game.is_empty() {
+                    let ok = rel.game.iter().any(|g| util::version_covers(g, gv));
+                    check_row(
+                        ui,
+                        Some(ok),
+                        "Game version",
+                        &if ok { format!("{gv} — supported by this build") } else { format!("{gv} — this build lists {} only; it may not load", rel.game.join(", ")) },
+                    );
+                }
+            }
 
             if s.needs_launch_option() {
                 let ok = s.launch_option_ok();
@@ -581,7 +625,7 @@ impl App {
         });
 
         ui.add_space(6.0);
-        let updates = self.nc_update_available() || self.r4_update_available();
+        let updates = self.nc_update_available();
         let all_good = self.status.ready() && !updates;
         ui.horizontal_wrapped(|ui| {
             let enabled = !self.busy() && self.status.game.is_some() && !self.status.game_running;
@@ -642,7 +686,7 @@ impl App {
                         ui.label(RichText::new(format!("you: {mine}   partner: {}", theirs.unwrap_or_else(|| "?".into()))).color(DIM));
                     });
                 }
-                ui.label(RichText::new("NightCoop must match to play together; the game version and Phantom Liberty should match too.").color(DIM).small());
+                ui.label(RichText::new("NightCoop builds with the same protocol play together; the game version and Phantom Liberty should match too.").color(DIM).small());
             }
         });
         if let Some(t) = &self.remote.checked_at {
@@ -655,8 +699,8 @@ impl App {
             info_card(
                 ui,
                 &format!(
-                    "NightCoop hasn't published a build yet (open beta: 23 October, 15:00 UTC). “Install everything” sets up {now} now; \
-                     press it again once the build is out — or install a build you downloaded from Discord via Mods & Versions → Install from file."
+                    "No NightCoop build is listed right now. “Install everything” sets up {now}; press it again once a build is listed — \
+                     or install a build you downloaded from Discord via Mods & Versions → Install from file."
                 ),
             );
         }
@@ -781,6 +825,9 @@ impl App {
                         if let Some(p) = r.protocol_str() {
                             meta.push(format!("Protocol: {p}"));
                         }
+                        if let Some(b) = &r.build {
+                            meta.push(format!("Build {b}"));
+                        }
                         if let Some(sz) = r.mod_file().and_then(|f| f.size) {
                             meta.push(util::human_size(sz));
                         }
@@ -820,53 +867,79 @@ impl App {
                 let cur = self.status.red4ext_version.clone().unwrap_or_else(|| "not installed".into());
                 ui.label(RichText::new(format!("installed: {cur}")).color(DIM));
             });
-            match &self.remote.red4ext {
-                None => {
-                    ui.label(RichText::new("Press “Check for updates” to see RED4ext releases.").color(DIM));
-                }
-                Some(Err(e)) => {
-                    ui.label(RichText::new(format!("Couldn't reach GitHub: {e}")).color(BAD));
-                }
-                Some(Ok(list)) => {
-                    let list: Vec<GhRelease> = list.iter().filter(|r| remote::red4ext_asset(r).is_some()).cloned().collect();
-                    if !list.is_empty() {
-                        self.r4_pick = self.r4_pick.min(list.len() - 1);
-                        ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt("r4pick")
-                                .selected_text(format!("{}  ({})", list[self.r4_pick].tag_name, list[self.r4_pick].date()))
-                                .show_ui(ui, |ui| {
-                                    for (i, r) in list.iter().enumerate() {
-                                        ui.selectable_value(&mut self.r4_pick, i, format!("{}  ({}){}", r.tag_name, r.date(), if r.prerelease { " pre-release" } else { "" }));
-                                    }
-                                });
-                            if ui.add_enabled(!self.busy(), egui::Button::new("Install selected")).clicked() {
-                                self.confirm = Some(Confirm::InstallR4Version(self.r4_pick));
-                            }
-                        });
-                        if let Some(body) = &list[self.r4_pick].body {
-                            ui.collapsing("Release notes", |ui| {
-                                egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| ui.label(body));
+            ui.label("Which RED4ext should the helper keep installed?");
+            let custom = self.state.red4ext_custom;
+            let bundled_label = match &self.state.red4ext_bundled {
+                Some(v) => format!("Bundled with NightCoop — {v} (recommended)"),
+                None => "Bundled with NightCoop (recommended)".to_string(),
+            };
+            if ui.radio(!custom, bundled_label).on_hover_text("Each NightCoop build ships the RED4ext it was tested with; updates keep them matched.").clicked() && custom {
+                self.use_bundled_red4ext(&ctx, &game);
+            }
+            if ui.radio(custom, "My own version").on_hover_text("Pick any release below. NightCoop updates will leave it alone.").clicked() && !custom {
+                self.state.red4ext_custom = true;
+                self.state.save();
+            }
+            if self.state.red4ext_custom {
+                ui.add_space(4.0);
+                match &self.remote.red4ext {
+                    None => {
+                        ui.label(RichText::new("Press “Check for updates” to see RED4ext releases.").color(DIM));
+                    }
+                    Some(Err(e)) => {
+                        ui.label(RichText::new(format!("Couldn't reach GitHub: {e}")).color(BAD));
+                    }
+                    Some(Ok(list)) => {
+                        let list: Vec<GhRelease> = list.iter().filter(|r| remote::red4ext_asset(r).is_some()).cloned().collect();
+                        if !list.is_empty() {
+                            self.r4_pick = self.r4_pick.min(list.len() - 1);
+                            ui.horizontal(|ui| {
+                                egui::ComboBox::from_id_salt("r4pick")
+                                    .selected_text(format!("{}  ({})", list[self.r4_pick].tag_name, list[self.r4_pick].date()))
+                                    .show_ui(ui, |ui| {
+                                        for (i, r) in list.iter().enumerate() {
+                                            ui.selectable_value(&mut self.r4_pick, i, format!("{}  ({}){}", r.tag_name, r.date(), if r.prerelease { " pre-release" } else { "" }));
+                                        }
+                                    });
+                                if ui.add_enabled(!self.busy(), egui::Button::new("Install selected")).clicked() {
+                                    self.confirm = Some(Confirm::InstallR4Version(self.r4_pick));
+                                }
                             });
+                            if let Some(body) = &list[self.r4_pick].body {
+                                ui.collapsing("Release notes", |ui| {
+                                    egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| ui.label(body));
+                                });
+                            }
                         }
                     }
                 }
-            }
-            ui.horizontal(|ui| {
                 if ui.add_enabled(!self.busy(), egui::Button::new("📂  Install from file…")).clicked() {
                     if let Some(file) = rfd::FileDialog::new().add_filter("RED4ext zip", &["zip"]).pick_file() {
                         let g = game.clone();
                         self.spawn(&ctx, "Installing RED4ext from file", move |rep, state, _| {
                             let ver = file.file_stem().map(|s| s.to_string_lossy().trim_start_matches("red4ext-").to_string()).unwrap_or_default();
+                            state.red4ext_custom = true;
                             ops::install_red4ext_archive(&g, &file, &ver, state, rep).map(|_| Extra::None)
                         });
                     }
                 }
-                if self.status.red4ext_version.is_some() && ui.add_enabled(!self.busy(), egui::Button::new("🗑  Uninstall")).clicked() {
-                    self.confirm = Some(Confirm::UninstallRed4ext);
+                ui.label(RichText::new("A RED4ext that doesn't match the NightCoop build may stop the mod from loading. Switch back to Bundled any time.").color(WARN).small());
+            }
+            if self.status.red4ext_version.is_some() && ui.add_enabled(!self.busy(), egui::Button::new("🗑  Uninstall RED4ext")).clicked() {
+                self.confirm = Some(Confirm::UninstallRed4ext);
+            }
+        });
+
+        // ----- remove everything -----
+        if self.status.red4ext_version.is_some() || self.status.nightcoop_installed || self.status.nightcoop_disabled || self.status.mods_off {
+            card(ui, |ui| {
+                ui.label(RichText::new("REMOVE EVERYTHING").color(ACCENT).strong());
+                ui.label(RichText::new("Want Cyberpunk stock again for good? This uninstalls NightCoop and RED4ext and removes the launch option in one go. For a break, use 🔌 Mods off on Home instead.").color(DIM));
+                if ui.add_enabled(!self.busy() && !self.status.game_running, egui::Button::new(RichText::new("🗑  Remove everything").color(BAD))).clicked() {
+                    self.confirm = Some(Confirm::RemoveAll);
                 }
             });
-            ui.label(RichText::new("After a Cyberpunk patch, RED4ext usually needs an update before mods load again.").color(DIM).small());
-        });
+        }
 
         // ----- launch options (only Proton needs them) -----
         if game.uses_proton() {
@@ -1114,13 +1187,14 @@ impl App {
         });
         card(ui, |ui| {
             ui.label(RichText::new("COMMON PROBLEMS").color(ACCENT).strong());
-            let items: [(&str, &str); 7] = [
+            let items: [(&str, &str); 8] = [
                 ("No “Co-op” item in the main menu", "RED4ext didn't load the plugin. Check the diagnostics above: RED4ext and NightCoop must be installed, and on Steam Deck/Linux the Proton launch option must be set. The RED4ext log says why a plugin was skipped."),
                 ("Worked before, broke after a game update", "Cyberpunk patches break RED4ext and plugins until they're updated. Press “Check for updates”, then “Update everything”. NightCoop lists the game versions each build supports."),
                 ("Can't join each other", "Everyone must run the same NightCoop build (same protocol number). Use “Copy my versions” on Home and compare."),
                 ("Game crashes on start (Deck)", "Try Proton Experimental or the latest Proton in Cyberpunk → Properties → Compatibility. As a last resort install vcrun2022 with Protontricks."),
                 ("Stutter every few seconds", "Use Borderless window instead of exclusive fullscreen, and turn off the Discord overlay / frame generation."),
                 ("“Server failed the key check”", "The server fingerprint doesn't match: a typo or the owner made a new key. Ask them for the current address#fingerprint."),
+                ("Remove the mod for good", "Mods & Versions → 🗑 Remove everything uninstalls NightCoop, RED4ext and the launch option. Saves stay."),
                 ("Want to play without mods", "Home → 🔌 Mods off. Cyberpunk then starts completely unmodded; your mods are kept and the Home page offers “Turn mods back ON” whenever you open the helper again."),
             ];
             for (q, a) in items {
@@ -1300,6 +1374,19 @@ impl App {
             Confirm::DeleteBackup(p) => ("Delete backup", format!("Delete {} permanently?", p.file_name().unwrap_or_default().to_string_lossy()), "Delete", None),
             Confirm::UninstallNightCoop => ("Uninstall NightCoop", "Removes the NightCoop plugin. Saves stay where they are; servers.txt is kept in the helper's backups.".into(), "Uninstall", None),
             Confirm::UninstallRed4ext => ("Uninstall RED4ext", "Removes the RED4ext loader. Other RED4ext plugins (if any) will stop loading too.".into(), "Uninstall", None),
+            Confirm::RemoveAll => (
+                "Remove everything",
+                format!(
+                    "Uninstalls NightCoop and RED4ext{} so Cyberpunk is completely stock again. Your saves and the helper's backups stay.",
+                    if self.status.needs_launch_option() && self.status.launch_option_ok() {
+                        if self.status.steam_running { " and removes the Steam launch option (Steam restarts)" } else { " and removes the Steam launch option" }
+                    } else {
+                        ""
+                    }
+                ),
+                "Remove everything",
+                None,
+            ),
             Confirm::AddToSteam => (
                 "Add helper to Steam",
                 if self.status.steam_running { "Steam will close, the shortcut is added, then Steam starts again.".into() } else { "A non-Steam game shortcut will be added.".into() },
@@ -1360,6 +1447,28 @@ impl App {
                     self.spawn(ctx, "Uninstalling NightCoop", move |rep, state, _| ops::uninstall_nightcoop(&g, state, rep).map(|_| Extra::None));
                 }
             }
+            Confirm::RemoveAll => {
+                if let Some(g) = game {
+                    let launch_option = self.status.needs_launch_option() && self.status.launch_option_ok();
+                    self.spawn(ctx, "Removing everything", move |rep, state, _| {
+                        if g.plugin_dir().exists() || g.disabled_plugin_dir().exists() || g.park_dir().exists() {
+                            ops::uninstall_nightcoop(&g, state, rep)?;
+                        }
+                        if g.dir.join("bin").join("x64").join("winmm.dll").is_file() || g.red4ext_dir().exists() {
+                            ops::uninstall_red4ext(&g, state, rep)?;
+                        }
+                        if launch_option {
+                            if steam::in_gaming_mode() {
+                                rep.log("The Steam launch option stays (can't restart Steam in Gaming Mode). It's harmless; remove it from Desktop Mode if you like.");
+                            } else {
+                                ops::apply_launch_option(&g, false, true, rep)?;
+                            }
+                        }
+                        rep.log("Cyberpunk 2077 is back to stock.");
+                        Ok(Extra::None)
+                    });
+                }
+            }
             Confirm::UninstallRed4ext => {
                 if let Some(g) = game {
                     self.spawn(ctx, "Uninstalling RED4ext", move |rep, state, _| ops::uninstall_red4ext(&g, state, rep).map(|_| Extra::None));
@@ -1404,7 +1513,10 @@ impl App {
                     _ => None,
                 };
                 if let (Some(g), Some(rel)) = (game, rel) {
-                    self.spawn(ctx, &format!("Installing RED4ext {}", rel.version()), move |rep, state, _| ops::install_red4ext_release(&g, &rel, state, rep).map(|_| Extra::None));
+                    self.spawn(ctx, &format!("Installing RED4ext {}", rel.version()), move |rep, state, _| {
+                        state.red4ext_custom = true;
+                        ops::install_red4ext_release(&g, &rel, state, rep).map(|_| Extra::None)
+                    });
                 }
             }
             Confirm::Rollback(p) => {
@@ -1426,7 +1538,7 @@ fn compare_versions(mine: &str, theirs: &str) -> Vec<(&'static str, String, Opti
                 .map(|_| part[key.len()..].trim().trim_start_matches(':').trim().to_string())
         })
     }
-    ["NightCoop", "RED4ext", "Game", "Phantom Liberty"]
+    ["NightCoop", "Protocol", "RED4ext", "Game", "Phantom Liberty"]
         .into_iter()
         .map(|key| {
             let m = field(mine, key).unwrap_or_default();
@@ -1566,11 +1678,14 @@ mod tests {
 
     #[test]
     fn partner_compare() {
-        let mine = "NightCoop 0.2.0 · RED4ext 1.30.0 · Game 2.5 · Phantom Liberty: yes";
-        let theirs = "NightCoop v0.2.0 · RED4ext 1.29.0 · Game 2.5 · Phantom Liberty: no";
+        let mine = "NightCoop 0.1.0-beta.1 · Protocol 128 · RED4ext 1.30.0 · Game 2.5 · Phantom Liberty: yes";
+        let theirs = "NightCoop v0.1.0-beta.1 · Protocol 128 · RED4ext 1.29.0 · Game 2.5 · Phantom Liberty: no";
         let r = compare_versions(mine, theirs);
         let same: Vec<bool> = r.iter().map(|x| x.3).collect();
-        assert_eq!(same, vec![true, false, true, false]);
+        assert_eq!(same, vec![true, true, false, true, false]);
+        // An older helper's text has no protocol: that row is just unknown.
+        let old = compare_versions(mine, "NightCoop 0.1.0-beta.1 · RED4ext 1.30.0 · Game 2.5 · Phantom Liberty: yes");
+        assert!(old[1].2.is_none() && old[0].3);
         assert!(compare_versions(mine, "hello").iter().all(|x| x.2.is_none()));
     }
 }
