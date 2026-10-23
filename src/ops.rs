@@ -57,6 +57,97 @@ fn staging(name: &str) -> PathBuf {
     config::sub("staging").join(name)
 }
 
+/// Keeps the download cache small: only the newest few archives stay.
+fn prune_downloads(keep: usize) {
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(config::sub("downloads"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, p) in files.into_iter().skip(keep) {
+        let _ = fs::remove_file(p);
+    }
+}
+
+// ---------- mods off / on ----------
+
+/// What "mods off" moves out of the game: RED4ext's loader and its whole folder (NightCoop included).
+fn parkable(game: &Game) -> [(PathBuf, PathBuf); 2] {
+    let park = game.park_dir();
+    [
+        (game.dir.join("bin").join("x64").join("winmm.dll"), park.join("bin").join("x64").join("winmm.dll")),
+        (game.red4ext_dir(), park.join("red4ext")),
+    ]
+}
+
+/// Moves a file or folder, falling back to copy + delete across filesystems.
+fn move_path(from: &Path, to: &Path) -> Result<()> {
+    if let Some(p) = to.parent() {
+        fs::create_dir_all(p)?;
+    }
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    if from.is_dir() {
+        util::copy_merge(from, to)?;
+        fs::remove_dir_all(from)?;
+    } else {
+        fs::copy(from, to)?;
+        fs::remove_file(from)?;
+    }
+    Ok(())
+}
+
+/// Turns every RED4ext mod off, leaving a vanilla game. Undo with [`mods_on`].
+pub fn mods_off(game: &Game, rep: &Reporter) -> Result<()> {
+    ensure_game_closed()?;
+    let mut moved = 0;
+    for (live, parked) in parkable(game) {
+        if live.exists() {
+            if parked.exists() {
+                if parked.is_dir() { fs::remove_dir_all(&parked)? } else { fs::remove_file(&parked)? }
+            }
+            move_path(&live, &parked).with_context(|| format!("cannot move {}", live.display()))?;
+            moved += 1;
+        }
+    }
+    if moved == 0 {
+        bail!("no mods are installed");
+    }
+    rep.log("Mods are OFF — Cyberpunk now starts unmodded. Turn them back on from Home any time.");
+    Ok(())
+}
+
+pub fn mods_on(game: &Game, rep: &Reporter) -> Result<()> {
+    ensure_game_closed()?;
+    for (live, parked) in parkable(game) {
+        if !parked.exists() {
+            continue;
+        }
+        if live.exists() {
+            // Something was reinstalled meanwhile; the newer live copy wins.
+            rep.log(format!("{} already exists; keeping it.", live.display()));
+            if parked.is_dir() { fs::remove_dir_all(&parked)? } else { fs::remove_file(&parked)? }
+        } else {
+            move_path(&parked, &live).with_context(|| format!("cannot restore {}", live.display()))?;
+        }
+    }
+    let _ = fs::remove_dir_all(game.park_dir());
+    rep.log("Mods are back ON.");
+    Ok(())
+}
+
+/// Installs and uninstalls work on the live folders, so bring parked mods back first.
+fn ensure_mods_on(game: &Game, rep: &Reporter) -> Result<()> {
+    if game.park_dir().exists() {
+        rep.log("Mods were switched off; turning them back on first.");
+        mods_on(game, rep)?;
+    }
+    Ok(())
+}
+
 // ---------- saves ----------
 
 pub fn backup_saves(game: &Game, settings: &Settings, state: &mut InstallState, rep: &Reporter, label: &str) -> Result<Option<PathBuf>> {
@@ -78,7 +169,25 @@ pub fn backup_saves(game: &Game, settings: &Settings, state: &mut InstallState, 
     rep.log(format!("Backed up {n} save files → {}", file.display()));
     state.last_save_backup = Some(util::timestamp());
     prune_backups(settings.keep_backups);
+    mirror_backup(&file, settings, rep);
     Ok(Some(file))
+}
+
+/// Copies a backup to the user's extra folder (SD card, USB stick, a synced cloud folder…).
+fn mirror_backup(file: &Path, settings: &Settings, rep: &Reporter) {
+    let dir = settings.backup_mirror.trim();
+    if dir.is_empty() {
+        return;
+    }
+    let dir = Path::new(dir);
+    if !dir.is_dir() {
+        rep.log(format!("Extra backup folder {} is not available (SD card or drive not connected?); skipped.", dir.display()));
+        return;
+    }
+    match fs::copy(file, dir.join(file.file_name().unwrap_or_default())) {
+        Ok(_) => rep.log(format!("Also copied to {}", dir.display())),
+        Err(e) => rep.log(format!("Could not copy the backup to {}: {e}", dir.display())),
+    }
 }
 
 pub fn list_backups() -> Vec<(PathBuf, u64)> {
@@ -106,10 +215,7 @@ fn prune_backups(keep: usize) {
 pub fn restore_saves(game: &Game, settings: &Settings, state: &mut InstallState, zip_path: &Path, rep: &Reporter) -> Result<()> {
     ensure_game_closed()?;
     let saves = game.saves_dir().ok_or_else(|| anyhow!("saves folder unknown"))?;
-    if saves.is_dir() {
-        rep.log("Backing up current saves before restoring…");
-        backup_saves(game, settings, state, rep, "before-restore")?;
-    }
+    // Unpack first: the safety backup below may prune old backups, including this one.
     let stage = staging("restore");
     util::extract_archive(zip_path, &stage)?;
     let src = stage.join("saves");
@@ -117,9 +223,26 @@ pub fn restore_saves(game: &Game, settings: &Settings, state: &mut InstallState,
         bail!("this backup does not look like a NightCoop Helper save backup");
     }
     if saves.is_dir() {
-        fs::remove_dir_all(&saves)?;
+        rep.log("Backing up current saves before restoring…");
+        backup_saves(game, settings, state, rep, "before-restore")?;
     }
-    let n = util::copy_merge(&src, &saves)?.len();
+    // Swap folders so a failed copy never leaves the player without saves.
+    let old = saves.with_file_name("Cyberpunk 2077.nchelper-old");
+    if old.exists() {
+        fs::remove_dir_all(&old)?;
+    }
+    if saves.is_dir() {
+        fs::rename(&saves, &old)?;
+    }
+    let n = match util::copy_merge(&src, &saves) {
+        Ok(files) => files.len(),
+        Err(e) => {
+            let _ = fs::remove_dir_all(&saves);
+            let _ = fs::rename(&old, &saves);
+            return Err(e.context("restore failed; your previous saves were put back"));
+        }
+    };
+    let _ = fs::remove_dir_all(&old);
     let _ = fs::remove_dir_all(&stage);
     rep.log(format!("Restored {n} files into {}", saves.display()));
     Ok(())
@@ -136,6 +259,7 @@ pub fn install_red4ext_release(game: &Game, rel: &GhRelease, state: &mut Install
 
 pub fn install_red4ext_archive(game: &Game, archive: &Path, version: &str, state: &mut InstallState, rep: &Reporter) -> Result<()> {
     ensure_game_closed()?;
+    ensure_mods_on(game, rep)?;
     rep.progress(None, "Installing RED4ext…");
     let stage = staging("red4ext");
     util::extract_archive(archive, &stage)?;
@@ -153,12 +277,15 @@ pub fn install_red4ext_archive(game: &Game, archive: &Path, version: &str, state
     state.red4ext_version = Some(version.to_string());
     state.red4ext_files = files;
     state.installed_at = Some(util::timestamp());
+    state.game_build_id = game.steam.as_ref().and_then(|g| g.build_id.clone());
+    prune_downloads(6);
     rep.log(format!("RED4ext {version} installed."));
     Ok(())
 }
 
 pub fn uninstall_red4ext(game: &Game, state: &mut InstallState, rep: &Reporter) -> Result<()> {
     ensure_game_closed()?;
+    ensure_mods_on(game, rep)?;
     let mut files: Vec<String> = state.red4ext_files.clone();
     if files.is_empty() {
         files = ["bin/x64/winmm.dll", "red4ext/RED4ext.dll", "red4ext/LICENSE.txt", "red4ext/THIRD_PARTY_LICENSES.txt"]
@@ -248,6 +375,7 @@ pub fn install_nightcoop_archive(
     rep: &Reporter,
 ) -> Result<()> {
     ensure_game_closed()?;
+    ensure_mods_on(game, rep)?;
     rep.progress(None, "Installing NightCoop…");
     let stage = staging("nightcoop");
     util::extract_archive(archive, &stage)?;
@@ -313,6 +441,7 @@ pub fn install_nightcoop_archive(
     if !dll.is_file() {
         bail!("install finished but {} is missing", dll.display());
     }
+    prune_downloads(6);
     let version = version.or_else(|| util::pe_version(&dll)).unwrap_or_else(|| "unknown".into());
     state.game_dir = game.dir.display().to_string();
     state.nightcoop_version = Some(version.clone());
@@ -320,6 +449,7 @@ pub fn install_nightcoop_archive(
     state.nightcoop_dll_sha256 = util::sha256_file(&dll).ok();
     state.nightcoop_from_file = Some(archive.display().to_string());
     state.installed_at = Some(util::timestamp());
+    state.game_build_id = game.steam.as_ref().and_then(|g| g.build_id.clone());
     rep.log(format!("NightCoop {version} installed ({n} files){}.", if kept.is_empty() { "" } else { ", your servers.txt was kept" }));
     Ok(())
 }
@@ -343,6 +473,7 @@ fn prune_rollbacks(keep: usize) {
 
 pub fn restore_rollback(game: &Game, snap: &Path, state: &mut InstallState, rep: &Reporter) -> Result<()> {
     ensure_game_closed()?;
+    ensure_mods_on(game, rep)?;
     let dest = game.plugin_dir();
     let kept: Vec<(String, Vec<u8>)> = KEEP_FILES.iter().filter_map(|n| fs::read(dest.join(n)).ok().map(|b| (n.to_string(), b))).collect();
     if dest.exists() {
@@ -362,6 +493,7 @@ pub fn restore_rollback(game: &Game, snap: &Path, state: &mut InstallState, rep:
 
 pub fn uninstall_nightcoop(game: &Game, state: &mut InstallState, rep: &Reporter) -> Result<()> {
     ensure_game_closed()?;
+    ensure_mods_on(game, rep)?;
     for dir in [game.plugin_dir(), game.disabled_plugin_dir()] {
         if dir.exists() {
             if let Ok(b) = fs::read(dir.join("servers.txt")) {
@@ -381,6 +513,7 @@ pub fn uninstall_nightcoop(game: &Game, state: &mut InstallState, rep: &Reporter
 /// Moves the plugin out of RED4ext's plugin folder (solo play) or back.
 pub fn set_nightcoop_enabled(game: &Game, enabled: bool, rep: &Reporter) -> Result<()> {
     ensure_game_closed()?;
+    ensure_mods_on(game, rep)?;
     let (from, to) = if enabled { (game.disabled_plugin_dir(), game.plugin_dir()) } else { (game.plugin_dir(), game.disabled_plugin_dir()) };
     if !from.exists() {
         bail!("nothing to {}", if enabled { "enable" } else { "disable" });
@@ -497,7 +630,7 @@ mod tests {
         assert_eq!(fs::read(game.plugin_dir().join("NightCoop.dll")).unwrap(), b"v2");
         assert!(!game.plugin_dir().join("old.txt").exists());
         assert_eq!(fs::read(game.servers_file()).unwrap(), b"hub.example.org#ABCD");
-        let snap = list_rollbacks().into_iter().find(|p| p.to_string_lossy().ends_with("0.1.0")).expect("rollback snapshot");
+        assert!(list_rollbacks().iter().any(|p| p.to_string_lossy().ends_with("0.1.0")), "rollback snapshot");
 
         // Status scan sees our version (DLL hash matches the record).
         let settings = Settings { game_path: game_dir.display().to_string(), ..Settings::default() };
@@ -511,6 +644,22 @@ mod tests {
         assert!(!game.plugin_dir().exists() && game.disabled_plugin_dir().join("NightCoop.dll").is_file());
         set_nightcoop_enabled(&game, true, &rep).unwrap();
         assert!(game.plugin_dir().join("NightCoop.dll").is_file());
+
+        // Mods off: a vanilla game, versions still visible, and back on again.
+        mods_off(&game, &rep).unwrap();
+        assert!(!game_dir.join("bin/x64/winmm.dll").exists() && !game.red4ext_dir().exists());
+        let st = crate::game::Status::scan(&settings, &state);
+        assert!(st.mods_off && st.nightcoop_installed && st.loader_present && !st.ready());
+        assert_eq!(st.nightcoop_version.as_deref(), Some("0.2.0"));
+        mods_on(&game, &rep).unwrap();
+        assert!(game_dir.join("bin/x64/winmm.dll").is_file() && game.plugin_dir().join("NightCoop.dll").is_file());
+        assert!(!game.park_dir().exists());
+        // Installing while mods are off brings them back first.
+        mods_off(&game, &rep).unwrap();
+        install_nightcoop_archive(&game, &nc2, Some("0.2.0".into()), None, &mut state, &rep).unwrap();
+        assert!(!game.park_dir().exists() && game_dir.join("bin/x64/winmm.dll").is_file());
+        assert_eq!(fs::read(game.servers_file()).unwrap(), b"hub.example.org#ABCD");
+        let snap = list_rollbacks().into_iter().find(|p| p.to_string_lossy().ends_with("0.1.0")).expect("rollback snapshot");
 
         // Roll back to 0.1.0, keeping servers.txt.
         restore_rollback(&game, &snap, &mut state, &rep).unwrap();

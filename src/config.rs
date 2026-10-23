@@ -64,6 +64,8 @@ pub struct Settings {
     pub backup_saves_before_install: bool,
     /// Keep this many save backups (oldest are deleted). 0 = keep all.
     pub keep_backups: usize,
+    /// Extra folder every save backup is also copied to (SD card, USB stick, a synced cloud folder). Empty = off.
+    pub backup_mirror: String,
     /// GitHub "owner/repo" where releases of this helper are published, for self-update.
     pub helper_repo: String,
     pub manifest_url: String,
@@ -78,6 +80,7 @@ impl Default for Settings {
             check_updates_on_start: true,
             backup_saves_before_install: true,
             keep_backups: 10,
+            backup_mirror: String::new(),
             helper_repo: crate::selfupdate::HOME_REPO.to_string(),
             manifest_url: crate::remote::NIGHTCOOP_MANIFEST.to_string(),
         }
@@ -106,6 +109,8 @@ pub struct InstallState {
     pub nightcoop_from_file: Option<String>,
     pub installed_at: Option<String>,
     pub last_save_backup: Option<String>,
+    /// Steam build of the game when mods were last installed, to spot game updates.
+    pub game_build_id: Option<String>,
 }
 
 impl InstallState {

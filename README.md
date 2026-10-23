@@ -45,10 +45,13 @@ Press the same button again whenever an update is out — it only replaces what 
 - 📦 **Version picker** — install any listed NightCoop build or RED4ext release, with notes, game versions and protocol numbers
 - ⏪ **One-click rollback** to your previous NightCoop build (last 3 kept)
 - 📂 **Install from file** — `.zip` / `.7z` builds shared on Discord, even with an extra wrapper folder
-- ⏸ **Disable / enable** NightCoop to play solo without uninstalling
+- 🔌 **Mods off / on** — one tap on Home for an unmodded game; everything is kept and the helper offers to turn mods back on whenever you open it again
+- ⚠ **Game-update alert** — warns when a Cyberpunk patch arrived after the mods were installed (the usual reason mods suddenly stop working)
+- 👥 **Compare with my partner** — paste their versions and see ✔/✖ for NightCoop, RED4ext, game and Phantom Liberty
 - 🌐 **Keeps your `servers.txt`** across updates; view, edit and copy it
 - 🐞 **Bug report zip** — RED4ext + NightCoop logs and a diagnostics summary in one file
 - 📋 **Copy my versions** — paste to your partner to confirm you run the same build
+- ☁ **Save safety** — automatic backups, restore with undo, export a backup anywhere, an **extra backup folder** (SD card, USB stick or a synced cloud folder like Dropbox/OneDrive/Syncthing), and a **Steam Cloud** status card
 - 🎮 **Add to Steam** — puts the helper in your library so it opens from **Gaming Mode**
 - 🔍 Finds the game in every Steam library (SD card too), plus GOG and Epic on Windows
 - 🖐 Big, touch-friendly UI sized for the Deck's 1280×800 screen, adjustable scale
@@ -83,6 +86,16 @@ Press the same button again whenever an update is out — it only replaces what 
 
 No launch options are needed on Windows — RED4ext loads by itself. Steam, GOG and Epic installs are detected automatically, or pick the game folder in **Settings**.
 
+## 🔌 Playing without mods
+
+Press **🔌 Mods off** on the Home page. RED4ext and NightCoop are moved aside, so Cyberpunk starts exactly like an unmodded game. Nothing is deleted: next time you open the helper it shows **Turn mods back ON**, and **Install everything** turns them back on too. Your saves are never touched.
+
+## ☁ Saves & the cloud
+
+- **Steam Cloud keeps working** with or without mods. Steam uploads saves when you quit the game and downloads them when you start it — there's no command to force a sync, so to sync now just start the game, reach the main menu and quit. The **Saves** page shows how many files Steam Cloud holds and when it last uploaded.
+- **Backups are your undo button**: Steam Cloud also syncs mistakes. The helper backs up saves before every install, keeps the newest 10, and can restore any of them (your current saves are backed up first).
+- **Extra copy**: on the Saves page, pick a second folder — the SD card, a USB stick, or a folder synced by Dropbox / OneDrive / Google Drive / Syncthing — and every backup is copied there too. **Export…** saves any single backup wherever you like.
+
 ## 🤝 Playing together
 
 - **Everyone needs the same NightCoop build** (builds with the same *protocol* number play together). Use **📋 Copy my versions** on the Home page and compare.
@@ -108,7 +121,7 @@ Game patches break RED4ext and its plugins until they're updated. Press **⟳ Ch
 <details>
 <summary><b>The game won't start on the Deck</b></summary>
 
-Cyberpunk 2077 → ⚙ Properties → Compatibility → try **Proton Experimental** or the newest Proton. If it still fails, **Disable (play solo)** to check that the game itself starts, then create a **bug report**.
+Cyberpunk 2077 → ⚙ Properties → Compatibility → try **Proton Experimental** or the newest Proton. If it still fails, press **🔌 Mods off** on Home to check that the game itself starts, then create a **bug report**.
 </details>
 
 <details>
@@ -128,6 +141,7 @@ That happens in Gaming Mode. Switch to Desktop Mode and press the button again, 
 | What | Where |
 |---|---|
 | Helper settings, save backups, rollbacks, downloads | `NightCoopHelper-data/` next to the helper — move them together |
+| Mods while switched off | `<game>/_NightCoopHelper_mods_off/` |
 | RED4ext | `<game>/bin/x64/winmm.dll`, `<game>/red4ext/` |
 | NightCoop | `<game>/red4ext/plugins/NightCoop/` (disabled: `<game>/red4ext/NightCoop.disabled/`) |
 | Steam launch-option backups | `NightCoopHelper-data/backups/steam-localconfig/` |
@@ -139,7 +153,7 @@ That happens in Gaming Mode. Switch to Desktop Mode and press the button again, 
 
 - Downloads come only from `github.com/WopsS/RED4ext` and `nightcoop.net`, and are **SHA-256 verified** when the source publishes a checksum.
 - Saves are backed up before every install; Steam's config is backed up before every edit.
-- The previous NightCoop build is kept for rollback.
+- The previous NightCoop build is kept for rollback, and "Mods off" only moves files — it never deletes them.
 - Everything is open source in this repo — see [`src/`](src).
 
 ## 🧑‍💻 Building from source

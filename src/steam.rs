@@ -176,6 +176,42 @@ pub fn proton_version(game: &SteamGame) -> Option<String> {
     (!v.is_empty()).then(|| v.to_string())
 }
 
+// ---------- Steam Cloud ----------
+
+#[derive(Debug, Clone)]
+pub struct CloudInfo {
+    pub files: usize,
+    /// Unix time of the newest file Steam has uploaded.
+    pub newest: Option<i64>,
+}
+
+impl CloudInfo {
+    pub fn newest_text(&self) -> String {
+        self.newest
+            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+            .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "unknown".into())
+    }
+}
+
+/// What Steam Cloud holds for Cyberpunk, read from Steam's own cache (`remotecache.vdf`).
+pub fn cloud_info(root: &Path) -> Option<CloudInfo> {
+    let rd = fs::read_dir(root.join("userdata")).ok()?;
+    let mut best: Option<CloudInfo> = None;
+    for e in rd.flatten() {
+        let Ok(text) = fs::read_to_string(e.path().join(CYBERPUNK_APPID).join("remotecache.vdf")) else { continue };
+        let Ok(doc) = vdf::parse(&text) else { continue };
+        let Some(app) = doc.get(CYBERPUNK_APPID) else { continue };
+        let files: Vec<&vdf::Value> = app.children().iter().map(|(_, v)| v).filter(|v| matches!(v, vdf::Value::Obj(_))).collect();
+        let newest = files.iter().filter_map(|f| f.get_str("remotetime")?.parse::<i64>().ok()).filter(|&t| t > 0).max();
+        let info = CloudInfo { files: files.len(), newest };
+        if best.as_ref().map(|b| info.files > b.files).unwrap_or(true) {
+            best = Some(info);
+        }
+    }
+    best
+}
+
 // ---------- launch options ----------
 
 #[derive(Debug, Clone)]

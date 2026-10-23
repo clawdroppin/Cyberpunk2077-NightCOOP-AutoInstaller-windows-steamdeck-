@@ -26,7 +26,7 @@ one-button flow working without a terminal.
 |---|---|
 | `src/main.rs` | Window setup (maximized on Deck), module list. |
 | `src/app.rs` | All GUI pages, the job runner (one background thread at a time), confirm modals, styling. |
-| `src/ops.rs` | Long-running operations: install/uninstall RED4ext & NightCoop, rollback, enable/disable, save backup/restore, launch options, bug report. Has the integration test. |
+| `src/ops.rs` | Long-running operations: install/uninstall RED4ext & NightCoop, rollback, mods off/on (parking), save backup/restore/mirror, launch options, bug report. Has the integration test. |
 | `src/game.rs` | Finding the game (Steam / GOG / Epic / manual) and `Status::scan` (what's installed, versions, saves, Proton, logs). |
 | `src/steam.rs` | Steam roots & libraries, `appmanifest`, launch-option merge/strip, process detection, Steam shutdown/start, Deck detection. |
 | `src/remote.rs` | Release feeds: GitHub releases API (RED4ext, helper) and `https://nightcoop.net/releases.json`. |
@@ -53,6 +53,12 @@ one-button flow working without a terminal.
   `digest: "sha256:…"` which we verify. Symbols zip is skipped.
 - **Proton** needs `WINEDLLOVERRIDES="winmm,version=n,b" %command%` (`version` is harmless; it helps CET users).
 - **Deck save path**: `<library>/steamapps/compatdata/1091500/pfx/drive_c/users/steamuser/Saved Games/CD Projekt Red/Cyberpunk 2077`.
+- **Mods off** moves `bin/x64/winmm.dll` and the whole `red4ext/` folder into `<game>/_NightCoopHelper_mods_off/`
+  (same drive, so it's a rename). `Status.mods_off` is "that folder exists"; every install/uninstall calls
+  `ensure_mods_on` first, and "Install everything" turns mods back on. Legacy `red4ext/NightCoop.disabled/` (v0.1.0) is still understood.
+- **Game updates** are detected by comparing the Steam `buildid` saved at install (`InstallState.game_build_id`) with the current one.
+- **Steam Cloud** status comes from `<steam>/userdata/<id>/1091500/remotecache.vdf` (read-only). There is no supported way to
+  force a sync; don't try to edit Steam's cloud files.
 - **Launch options** live in `<steam>/userdata/<id>/config/localconfig.vdf` →
   `UserLocalConfigStore/Software/Valve/Steam/apps/1091500/LaunchOptions` (key case varies: `apps`/`Apps`).
 
@@ -104,5 +110,13 @@ When the first build is published, verify and adjust:
 - [ ] "Add to Steam" shortcut appears in Gaming Mode and launches.
 - [ ] File picker (xdg-desktop-portal) works in Desktop Mode.
 - [ ] Remove the "open beta 23 October" hint on Home once builds exist (it only shows while the list is empty).
-- Ideas: compare versions with a partner via invite string, Windows exe icon, Proton version recommendation,
-  detect Heroic/Lutris installs on Linux.
+- [ ] Confirm the real NightCoop build doesn't need anything outside `red4ext/` (Mods off only parks RED4ext's files).
+- Ideas: Windows exe/window icon, Proton version recommendation, detect Heroic/Lutris installs on Linux,
+  controller-friendly focus navigation for Gaming Mode.
+
+## Changelog
+
+- **0.2.0** — Mods off/on switch (survives restarts), game-update alert, partner version compare, Steam Cloud status,
+  extra backup folder + export, safer restore (folder swap; can't prune the backup being restored), download cache pruning,
+  no more `panic = "abort"` (a failing job shows an error instead of closing the app), fewer per-frame disk/process scans.
+- **0.1.0** — First release.

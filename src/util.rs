@@ -211,6 +211,21 @@ pub fn same_version(a: &str, b: &str) -> bool {
     cmp_versions(a, b) == Ordering::Equal
 }
 
+fn version_numbers(s: &str) -> Vec<u64> {
+    s.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty()).filter_map(|p| p.parse().ok()).collect()
+}
+
+/// True when a supported-version entry like "2.3" or "2.31" covers the game version
+/// (the entry's numbers are a prefix of the game's, or the texts start alike).
+pub fn version_covers(entry: &str, game: &str) -> bool {
+    let (e, g) = (version_numbers(entry), version_numbers(game));
+    if e.is_empty() || g.is_empty() {
+        return false;
+    }
+    let n = e.len().min(g.len());
+    e[..n] == g[..n] || game.trim().starts_with(entry.trim())
+}
+
 /// Reads the FileVersion / ProductVersion of a Windows PE file (works on any OS).
 pub fn pe_version(path: &Path) -> Option<String> {
     use pelite::pe64::{Pe, PeFile};
@@ -250,5 +265,9 @@ mod tests {
         assert_eq!(cmp_versions("v1.30.0", "1.29.9"), Ordering::Greater);
         assert_eq!(cmp_versions("1.2", "1.2.0"), Ordering::Equal);
         assert_eq!(cmp_versions("0.9.10", "0.9.9"), Ordering::Greater);
+        assert!(version_covers("2.3", "2.3.1"));
+        assert!(version_covers("2.31", "2.31"));
+        assert!(!version_covers("2.3", "2.5"));
+        assert!(!version_covers("", "2.5"));
     }
 }

@@ -104,6 +104,9 @@ pub struct App {
     rollbacks: Vec<PathBuf>,
     last_poll: Instant,
     helper_restart_ready: bool,
+    partner_text: String,
+    /// Any Steam install found (cached; looking it up hits the disk).
+    steam_found: bool,
 }
 
 impl App {
@@ -131,6 +134,8 @@ impl App {
             rollbacks: ops::list_rollbacks(),
             last_poll: Instant::now(),
             helper_restart_ready: false,
+            partner_text: String::new(),
+            steam_found: !steam::steam_roots().is_empty(),
         };
         // NCH_PAGE=versions|saves|… opens a page directly (handy for screenshots and testing).
         if let Ok(p) = std::env::var("NCH_PAGE") {
@@ -187,8 +192,10 @@ impl App {
             return;
         }
         let job = self.job.take().unwrap();
-        while let Ok(Event::Log(l)) = job.rx.try_recv() {
-            self.log.push(l);
+        while let Ok(ev) = job.rx.try_recv() {
+            if let Event::Log(l) = ev {
+                self.log.push(l);
+            }
         }
         self.progress = None;
         match job.handle.join() {
@@ -242,8 +249,9 @@ impl App {
         self.status = Status::scan(&self.settings, &self.state);
         self.backups = ops::list_backups();
         self.rollbacks = ops::list_rollbacks();
-        self.servers_text = None;
-        self.servers_dirty = false;
+        if !self.servers_dirty {
+            self.servers_text = None;
+        }
     }
 
     fn check_updates(&mut self, ctx: &egui::Context) {
@@ -306,6 +314,9 @@ impl App {
             if steam::game_running() {
                 return Err(anyhow!("Cyberpunk 2077 is running. Quit the game first."));
             }
+            if game.park_dir().exists() {
+                ops::mods_on(&game, rep)?;
+            }
             rep.log("Checking for the latest versions…");
             let info = fetch_remote(settings);
 
@@ -363,6 +374,8 @@ impl App {
                     ops::apply_launch_option(&game, true, restart_steam, rep)?;
                 }
             }
+            // Everything is current for this game build now.
+            state.game_build_id = game.steam.as_ref().and_then(|g| g.build_id.clone());
             Ok(Extra::Remote(info))
         });
     }
@@ -458,6 +471,35 @@ impl App {
         if self.status.game_running {
             warn_card(ui, "Cyberpunk 2077 is running. Quit the game before installing or updating.");
         }
+        if self.status.mods_off {
+            let enabled = !self.busy() && !self.status.game_running;
+            card(ui, |ui| {
+                ui.label(RichText::new("MODS ARE OFF").color(WARN).strong().size(18.0));
+                ui.label("Cyberpunk starts unmodded (no Co-op menu). RED4ext and NightCoop are kept safe and come back with one click.");
+                let b = egui::Button::new(RichText::new("🔌  Turn mods back ON").size(18.0).strong().color(Color32::BLACK)).fill(OK).min_size(egui::vec2(240.0, 44.0));
+                if ui.add_enabled(enabled, b).clicked() {
+                    if let Some(g) = self.status.game.clone() {
+                        self.spawn(&ctx, "Turning mods on", move |rep, _, _| ops::mods_on(&g, rep).map(|_| Extra::None));
+                    }
+                }
+            });
+        }
+        if self.status.game_updated && !self.status.mods_off {
+            card(ui, |ui| {
+                ui.label(RichText::new("⚠  Cyberpunk 2077 was updated since the mods were installed").color(WARN).strong());
+                ui.label("Game patches often break RED4ext and NightCoop until they're updated too. Check for updates, then press Update everything.");
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!self.busy(), egui::Button::new("⟳  Check for updates")).clicked() {
+                        self.check_updates(&ctx);
+                    }
+                    if ui.button("It works, dismiss").clicked() {
+                        self.state.game_build_id = self.status.steam_build.clone();
+                        self.state.save();
+                        self.status.game_updated = false;
+                    }
+                });
+            });
+        }
         if let Some(Ok(Some(u))) = self.remote.helper.clone() {
             let v = u.version.clone();
             card(ui, |ui| {
@@ -484,12 +526,15 @@ impl App {
                     ui,
                     Some(true),
                     "Cyberpunk 2077",
-                    &format!(
-                        "{} · {}{}",
-                        g.store.label(),
-                        s.game_version.clone().map(|v| format!("exe {v}")).unwrap_or_default(),
-                        if s.phantom_liberty { " · Phantom Liberty" } else { "" }
-                    ),
+                    &[
+                        Some(g.store.label().to_string()),
+                        s.game_version.clone().map(|v| format!("exe {v}")),
+                        s.phantom_liberty.then(|| "Phantom Liberty".to_string()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · "),
                 ),
                 None => check_row(ui, Some(false), "Cyberpunk 2077", "not found — set the game folder in Settings"),
             }
@@ -502,8 +547,10 @@ impl App {
             let r4_ok = if s.red4ext_version.is_some() && s.loader_present { Some(true).filter(|_| !self.r4_update_available()).or(None) } else { Some(false) };
             check_row(ui, r4_ok, "RED4ext (mod loader)", &r4_detail);
 
-            let nc_detail = if s.nightcoop_disabled {
-                "disabled (solo mode) — enable it on Mods & Versions".to_string()
+            let nc_detail = if s.mods_off && s.nightcoop_installed {
+                format!("{} — switched off", s.nightcoop_version.clone().unwrap_or_default())
+            } else if s.nightcoop_disabled {
+                "disabled — enable it on Mods & Versions".to_string()
             } else {
                 match (&s.nightcoop_version, s.nightcoop_installed) {
                     (Some(v), true) if self.nc_update_available() => format!("{v} → {} available", self.nc_latest().unwrap().version),
@@ -534,13 +581,16 @@ impl App {
         });
 
         ui.add_space(6.0);
-        let all_good = self.status.ready() && !self.nc_update_available() && !self.r4_update_available();
+        let updates = self.nc_update_available() || self.r4_update_available();
+        let all_good = self.status.ready() && !updates;
         ui.horizontal_wrapped(|ui| {
             let enabled = !self.busy() && self.status.game.is_some() && !self.status.game_running;
             let label = if all_good {
                 "✔  Re-check & repair"
+            } else if updates {
+                "⬆  Install updates"
             } else if self.status.red4ext_version.is_some() || self.status.nightcoop_installed {
-                "⬆  Update everything"
+                "⬆  Update & repair"
             } else {
                 "⬇  Install everything"
             };
@@ -563,6 +613,36 @@ impl App {
             if ui.button("📋  Copy my versions").on_hover_text("Send this to your co-op partner: everyone needs the same build").clicked() {
                 ui.ctx().copy_text(self.share_text());
                 self.banner = Some((true, "Versions copied — paste them to your partner to compare.".into()));
+            }
+            let installed = (self.status.red4ext_version.is_some() || self.status.nightcoop_installed) && !self.status.mods_off;
+            if installed
+                && ui
+                    .add_enabled(!self.busy() && !self.status.game_running, egui::Button::new("🔌  Mods off"))
+                    .on_hover_text("Play unmodded. Everything is kept and comes back with one click — even after closing the helper.")
+                    .clicked()
+            {
+                if let Some(g) = self.status.game.clone() {
+                    self.spawn(&ctx, "Turning mods off", move |rep, _, _| ops::mods_off(&g, rep).map(|_| Extra::None));
+                }
+            }
+        });
+        egui::CollapsingHeader::new("👥  Compare with my partner").show(ui, |ui| {
+            ui.label(RichText::new("Paste the text your partner copied with “Copy my versions”:").color(DIM));
+            ui.add(egui::TextEdit::singleline(&mut self.partner_text).desired_width(f32::INFINITY).hint_text("NightCoop 0.1.0 · RED4ext 1.30.0 · Game 2.5 · Phantom Liberty: yes"));
+            if !self.partner_text.trim().is_empty() {
+                for (label, mine, theirs, same) in compare_versions(&self.share_text(), &self.partner_text) {
+                    let (icon, color) = match (&theirs, same) {
+                        (Some(_), true) => ("✔", OK),
+                        (Some(_), false) => ("✖", BAD),
+                        (None, _) => ("●", DIM),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(icon).color(color));
+                        ui.label(RichText::new(label).strong());
+                        ui.label(RichText::new(format!("you: {mine}   partner: {}", theirs.unwrap_or_else(|| "?".into()))).color(DIM));
+                    });
+                }
+                ui.label(RichText::new("NightCoop must match to play together; the game version and Phantom Liberty should match too.").color(DIM).small());
             }
         });
         if let Some(t) = &self.remote.checked_at {
@@ -633,10 +713,6 @@ impl App {
                             Ok(Extra::None)
                         });
                     }
-                }
-                if self.status.nightcoop_installed && ui.add_enabled(!self.busy(), egui::Button::new("⏸  Disable (play solo)")).clicked() {
-                    let g = game.clone();
-                    self.spawn(&ctx, "Disabling NightCoop", move |rep, _, _| ops::set_nightcoop_enabled(&g, false, rep).map(|_| Extra::None));
                 }
                 if self.status.nightcoop_disabled && ui.add_enabled(!self.busy(), egui::Button::new("▶  Enable NightCoop")).clicked() {
                     let g = game.clone();
@@ -710,6 +786,11 @@ impl App {
                         }
                         if !meta.is_empty() {
                             ui.label(RichText::new(meta.join("  ·  ")).color(DIM));
+                        }
+                        if let Some(gv) = &self.status.game_version {
+                            if !r.game.is_empty() && !r.game.iter().any(|g| util::version_covers(g, gv)) {
+                                ui.label(RichText::new(format!("Not listed for your game version ({gv}) — it may not load.")).color(WARN));
+                            }
                         }
                         if let Some(reason) = r.yank_reason() {
                             ui.label(RichText::new(format!("Withdrawn: {reason}")).color(BAD));
@@ -873,12 +954,72 @@ impl App {
                     if ui.add_enabled(!self.busy(), egui::Button::new("Restore")).clicked() {
                         self.confirm = Some(Confirm::RestoreSaves(path.clone()));
                     }
+                    if ui.button("Export…").on_hover_text("Save a copy anywhere: SD card, USB stick, a cloud folder").clicked() {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        if let Some(dest) = rfd::FileDialog::new().set_file_name(&name).add_filter("Save backup", &["zip"]).save_file() {
+                            self.banner = Some(match std::fs::copy(&path, &dest) {
+                                Ok(_) => (true, format!("Backup exported to {}", dest.display())),
+                                Err(e) => (false, format!("Export failed: {e}")),
+                            });
+                        }
+                    }
                     if ui.add_enabled(!self.busy(), egui::Button::new("Delete")).clicked() {
                         self.confirm = Some(Confirm::DeleteBackup(path.clone()));
                     }
                 });
             }
             ui.label(RichText::new(format!("Keeping the newest {} backups (change in Settings).", self.settings.keep_backups)).color(DIM).small());
+        });
+        card(ui, |ui| {
+            ui.label(RichText::new("EXTRA COPY OF EVERY BACKUP").color(ACCENT).strong());
+            ui.label(RichText::new(
+                "Pick a second place for backups: the SD card, a USB stick, or a folder that syncs to the cloud (Dropbox, OneDrive, Google Drive, Syncthing…). Every new backup is copied there automatically.",
+            )
+            .color(DIM));
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                changed |= ui.add(egui::TextEdit::singleline(&mut self.settings.backup_mirror).desired_width(380.0).hint_text("off")).lost_focus();
+                if ui.button("Browse…").clicked() {
+                    if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                        self.settings.backup_mirror = d.display().to_string();
+                        changed = true;
+                    }
+                }
+                if !self.settings.backup_mirror.is_empty() && ui.button("Turn off").clicked() {
+                    self.settings.backup_mirror.clear();
+                    changed = true;
+                }
+            });
+            let mirror = self.settings.backup_mirror.trim().to_string();
+            if !mirror.is_empty() {
+                let ok = std::path::Path::new(&mirror).is_dir();
+                ui.label(RichText::new(if ok { "✔ Folder found" } else { "✖ Folder not found right now (SD card or drive not connected?)" }).color(if ok { OK } else { WARN }).small());
+            }
+            if changed {
+                self.settings.save();
+            }
+        });
+        card(ui, |ui| {
+            ui.label(RichText::new("STEAM CLOUD").color(ACCENT).strong());
+            match &self.status.cloud {
+                Some(c) => {
+                    ui.label(format!("Steam Cloud holds {} Cyberpunk files · last upload {}", c.files, c.newest_text()));
+                }
+                None if game.steam.is_some() => {
+                    ui.label(RichText::new("No Steam Cloud record found for Cyberpunk on this device yet.").color(DIM));
+                }
+                None => {
+                    ui.label(RichText::new("Steam Cloud only applies to the Steam version.").color(DIM));
+                }
+            }
+            ui.label(RichText::new(
+                "Steam uploads saves by itself when you quit the game, and downloads them when you start it — there is no button to force it. To sync now: start Cyberpunk, wait for the main menu, quit normally. Make sure “Keep game saves in the Steam Cloud” is on in Cyberpunk → Properties → General. Steam Cloud mirrors mistakes too, so the backups above                  are your undo button.",
+            )
+            .color(DIM)
+            .small());
+            if game.steam.is_some() && ui.button("Open Steam Cloud storage page").on_hover_text("Steam's website lists every file it keeps for each game").clicked() {
+                util::open_path("https://store.steampowered.com/account/remotestorage");
+            }
         });
     }
 
@@ -980,7 +1121,7 @@ impl App {
                 ("Game crashes on start (Deck)", "Try Proton Experimental or the latest Proton in Cyberpunk → Properties → Compatibility. As a last resort install vcrun2022 with Protontricks."),
                 ("Stutter every few seconds", "Use Borderless window instead of exclusive fullscreen, and turn off the Discord overlay / frame generation."),
                 ("“Server failed the key check”", "The server fingerprint doesn't match: a typo or the owner made a new key. Ask them for the current address#fingerprint."),
-                ("Want to play solo again", "Mods & Versions → Disable (play solo). Enable it again any time."),
+                ("Want to play without mods", "Home → 🔌 Mods off. Cyberpunk then starts completely unmodded; your mods are kept and the Home page offers “Turn mods back ON” whenever you open the helper again."),
             ];
             for (q, a) in items {
                 ui.collapsing(q, |ui| {
@@ -1024,7 +1165,7 @@ impl App {
         card(ui, |ui| {
             ui.label(RichText::new("Open this helper from Gaming Mode").color(ACCENT).strong().size(17.0));
             ui.label("Adds the helper to your Steam library as a non-Steam game, so you can check for updates without switching to Desktop Mode. Steam restarts once.");
-            let possible = self.status.game.as_ref().and_then(|g| g.steam.as_ref()).is_some() || !steam::steam_roots().is_empty();
+            let possible = self.status.game.as_ref().and_then(|g| g.steam.as_ref()).is_some() || self.steam_found;
             if ui.add_enabled(possible && !self.busy() && !steam::in_gaming_mode(), egui::Button::new("➕  Add to Steam")).clicked() {
                 self.confirm = Some(Confirm::AddToSteam);
             }
@@ -1146,7 +1287,7 @@ impl App {
             ),
             Confirm::LaunchOption { enable } => (
                 if *enable { "Set launch option" } else { "Remove launch option" },
-                if steam::steam_running() { "Steam will close and start again to save the change.".into() } else { "The launch option for Cyberpunk 2077 will be changed.".into() },
+                if self.status.steam_running { "Steam will close and start again to save the change.".into() } else { "The launch option for Cyberpunk 2077 will be changed.".into() },
                 "Continue",
                 None,
             ),
@@ -1161,7 +1302,7 @@ impl App {
             Confirm::UninstallRed4ext => ("Uninstall RED4ext", "Removes the RED4ext loader. Other RED4ext plugins (if any) will stop loading too.".into(), "Uninstall", None),
             Confirm::AddToSteam => (
                 "Add helper to Steam",
-                if steam::steam_running() { "Steam will close, the shortcut is added, then Steam starts again.".into() } else { "A non-Steam game shortcut will be added.".into() },
+                if self.status.steam_running { "Steam will close, the shortcut is added, then Steam starts again.".into() } else { "A non-Steam game shortcut will be added.".into() },
                 "Add",
                 None,
             ),
@@ -1273,6 +1414,30 @@ impl App {
             }
         }
     }
+}
+
+/// Lines up the fields of two "Copy my versions" texts: (label, mine, theirs, matching).
+fn compare_versions(mine: &str, theirs: &str) -> Vec<(&'static str, String, Option<String>, bool)> {
+    fn field(text: &str, key: &str) -> Option<String> {
+        text.split(['·', '|', '\n']).find_map(|part| {
+            let part = part.trim();
+            part.get(..key.len())
+                .filter(|p| p.eq_ignore_ascii_case(key))
+                .map(|_| part[key.len()..].trim().trim_start_matches(':').trim().to_string())
+        })
+    }
+    ["NightCoop", "RED4ext", "Game", "Phantom Liberty"]
+        .into_iter()
+        .map(|key| {
+            let m = field(mine, key).unwrap_or_default();
+            let t = field(theirs, key);
+            let same = t.as_deref().map(|t| {
+                let numeric = t.chars().any(|c| c.is_ascii_digit()) && m.chars().any(|c| c.is_ascii_digit());
+                if numeric { util::same_version(t, &m) } else { t.eq_ignore_ascii_case(&m) }
+            });
+            (key, m, t, same.unwrap_or(false))
+        })
+        .collect()
 }
 
 fn fetch_remote(settings: &Settings) -> RemoteInfo {
@@ -1393,4 +1558,19 @@ fn check_row(ui: &mut egui::Ui, ok: Option<bool>, title: &str, detail: &str) {
         ui.label(RichText::new(title).strong().size(16.0));
         ui.label(RichText::new(detail).color(DIM));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partner_compare() {
+        let mine = "NightCoop 0.2.0 · RED4ext 1.30.0 · Game 2.5 · Phantom Liberty: yes";
+        let theirs = "NightCoop v0.2.0 · RED4ext 1.29.0 · Game 2.5 · Phantom Liberty: no";
+        let r = compare_versions(mine, theirs);
+        let same: Vec<bool> = r.iter().map(|x| x.3).collect();
+        assert_eq!(same, vec![true, false, true, false]);
+        assert!(compare_versions(mine, "hello").iter().all(|x| x.2.is_none()));
+    }
 }

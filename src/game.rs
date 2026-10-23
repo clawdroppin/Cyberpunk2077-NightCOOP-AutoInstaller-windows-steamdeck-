@@ -107,6 +107,10 @@ impl Game {
     pub fn disabled_plugin_dir(&self) -> PathBuf {
         self.red4ext_dir().join("NightCoop.disabled")
     }
+    /// Where "mods off" keeps RED4ext and NightCoop while the game runs unmodded.
+    pub fn park_dir(&self) -> PathBuf {
+        self.dir.join("_NightCoopHelper_mods_off")
+    }
     pub fn servers_file(&self) -> PathBuf {
         self.plugin_dir().join("servers.txt")
     }
@@ -148,6 +152,12 @@ pub struct Status {
     pub game_running: bool,
     pub log_lines: Vec<String>,
     pub log_file: Option<PathBuf>,
+    /// RED4ext and NightCoop are parked (mods switched off).
+    pub mods_off: bool,
+    pub steam_build: Option<String>,
+    /// The game's Steam build changed since mods were installed.
+    pub game_updated: bool,
+    pub cloud: Option<steam::CloudInfo>,
 }
 
 impl Status {
@@ -158,18 +168,26 @@ impl Status {
 
         s.game_version = util::pe_version(&game.exe());
         s.phantom_liberty = game.dir.join("archive").join("pc").join("ep1").is_dir();
-        s.loader_present = game.dir.join("bin").join("x64").join("winmm.dll").is_file();
-        let r4 = game.red4ext_dir().join("RED4ext.dll");
+        s.mods_off = game.park_dir().exists();
+        // While mods are off, report what is parked so versions stay visible.
+        let (bin_dir, r4_dir) = if s.mods_off {
+            (game.park_dir().join("bin").join("x64"), game.park_dir().join("red4ext"))
+        } else {
+            (game.dir.join("bin").join("x64"), game.red4ext_dir())
+        };
+        s.loader_present = bin_dir.join("winmm.dll").is_file();
+        let r4 = r4_dir.join("RED4ext.dll");
         if r4.is_file() {
             s.red4ext_version = util::pe_version(&r4)
                 .or_else(|| same_dir.then(|| state.red4ext_version.clone()).flatten())
                 .or_else(|| Some("unknown version".into()));
         }
-        let dll = game.plugin_dir().join("NightCoop.dll");
+        let dll = r4_dir.join("plugins").join("NightCoop").join("NightCoop.dll");
+        let legacy_disabled = r4_dir.join("NightCoop.disabled").join("NightCoop.dll");
         s.nightcoop_installed = dll.is_file();
-        s.nightcoop_disabled = !s.nightcoop_installed && game.disabled_plugin_dir().join("NightCoop.dll").is_file();
+        s.nightcoop_disabled = !s.nightcoop_installed && legacy_disabled.is_file();
         if s.nightcoop_installed || s.nightcoop_disabled {
-            let dll = if s.nightcoop_installed { dll } else { game.disabled_plugin_dir().join("NightCoop.dll") };
+            let dll = if s.nightcoop_installed { dll } else { legacy_disabled };
             // Trust our record only while the DLL is still the one we installed.
             let ours = same_dir
                 && state.nightcoop_dll_sha256.is_some()
@@ -190,6 +208,11 @@ impl Status {
         if let Some(sg) = &game.steam {
             s.proton = steam::proton_version(sg);
             s.users = steam::user_configs(&sg.steam_root);
+            s.cloud = steam::cloud_info(&sg.steam_root);
+            s.steam_build = sg.build_id.clone();
+            s.game_updated = same_dir
+                && (s.nightcoop_installed || s.red4ext_version.is_some())
+                && matches!((&state.game_build_id, &sg.build_id), (Some(a), Some(b)) if a != b);
         }
         (s.log_file, s.log_lines) = red4ext_log_summary(&game);
         s.game = Some(game);
@@ -206,6 +229,7 @@ impl Status {
 
     pub fn ready(&self) -> bool {
         self.game.is_some()
+            && !self.mods_off
             && self.loader_present
             && self.red4ext_version.is_some()
             && self.nightcoop_installed
@@ -239,6 +263,11 @@ impl Status {
         line("RED4ext", opt(&self.red4ext_version));
         line("NightCoop", format!("{} (installed {}, disabled {})", opt(&self.nightcoop_version), self.nightcoop_installed, self.nightcoop_disabled));
         line("Installed by helper", opt(&state.installed_at));
+        line("Mods switched off", self.mods_off.to_string());
+        line("Game updated since install", self.game_updated.to_string());
+        if let Some(c) = &self.cloud {
+            line("Steam Cloud", format!("{} files, last upload {}", c.files, c.newest_text()));
+        }
         line("Saves", format!("{} saves, {}", self.save_count, util::human_size(self.saves_size)));
         line("Saves folder", self.saves_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()));
         for u in &self.users {
