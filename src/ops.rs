@@ -150,13 +150,20 @@ fn ensure_mods_on(game: &Game, rep: &Reporter) -> Result<()> {
 
 // ---------- saves ----------
 
-pub fn backup_saves(game: &Game, settings: &Settings, state: &mut InstallState, rep: &Reporter, label: &str) -> Result<Option<PathBuf>> {
+/// Zips the saves into the helper's backups. `only_if_changed` skips the copy when nothing changed
+/// since the last backup (automatic backups would otherwise fill the Deck with identical zips).
+pub fn backup_saves(game: &Game, settings: &Settings, state: &mut InstallState, rep: &Reporter, label: &str, only_if_changed: bool) -> Result<Option<PathBuf>> {
     let Some(saves) = game.saves_dir() else {
         rep.log("Saves folder not known for this install; skipping backup.");
         return Ok(None);
     };
     if !saves.is_dir() {
         rep.log("No saves folder yet (game never saved); nothing to back up.");
+        return Ok(None);
+    }
+    let fingerprint = util::dir_fingerprint(&saves);
+    if only_if_changed && fingerprint.is_some() && fingerprint == state.last_backup_fingerprint && !list_backups().is_empty() {
+        rep.log("Saves haven't changed since the last backup; no new copy needed.");
         return Ok(None);
     }
     rep.progress(None, "Backing up saves…");
@@ -168,6 +175,7 @@ pub fn backup_saves(game: &Game, settings: &Settings, state: &mut InstallState, 
     zip.finish()?;
     rep.log(format!("Backed up {n} save files → {}", file.display()));
     state.last_save_backup = Some(util::timestamp());
+    state.last_backup_fingerprint = fingerprint;
     prune_backups(settings.keep_backups);
     mirror_backup(&file, settings, rep);
     Ok(Some(file))
@@ -224,7 +232,7 @@ pub fn restore_saves(game: &Game, settings: &Settings, state: &mut InstallState,
     }
     if saves.is_dir() {
         rep.log("Backing up current saves before restoring…");
-        backup_saves(game, settings, state, rep, "before-restore")?;
+        backup_saves(game, settings, state, rep, "before-restore", false)?;
     }
     // Swap folders so a failed copy never leaves the player without saves.
     let old = saves.with_file_name("Cyberpunk 2077.nchelper-old");
@@ -431,12 +439,16 @@ pub fn install_nightcoop_archive(
         fs::remove_dir_all(game.disabled_plugin_dir())?;
     }
     if dest.exists() {
-        // Snapshot the old build so it can be rolled back.
-        let old_ver = state.nightcoop_version.clone().unwrap_or_else(|| "unknown".into());
-        let snap = config::sub("rollback").join(format!("{}__{}", util::timestamp(), sanitize(&old_ver)));
-        util::copy_merge(&dest, &snap)?;
-        prune_rollbacks(3);
-        rep.log(format!("Previous build saved for rollback ({old_ver})."));
+        // Snapshot the old build so it can be rolled back — unless it is this very build (a repair),
+        // which would only push real older builds out of the rollback list.
+        let same_build = util::sha256_file(&dest.join("NightCoop.dll")).ok() == util::sha256_file(&plugin_src.join("NightCoop.dll")).ok();
+        if !same_build {
+            let old_ver = state.nightcoop_version.clone().unwrap_or_else(|| "unknown".into());
+            let snap = config::sub("rollback").join(format!("{}__{}", util::timestamp(), sanitize(&old_ver)));
+            util::copy_merge(&dest, &snap)?;
+            prune_rollbacks(3);
+            rep.log(format!("Previous build saved for rollback ({old_ver})."));
+        }
         // The docs say: replace the folder as a whole, leave no old files.
         fs::remove_dir_all(&dest).with_context(|| format!("cannot remove old {}", dest.display()))?;
     }
@@ -464,6 +476,7 @@ pub fn install_nightcoop_archive(
     state.nightcoop_version = Some(version.clone());
     state.nightcoop_sha256 = sha256;
     state.nightcoop_dll_sha256 = util::sha256_file(&dll).ok();
+    state.nightcoop_dll_stamp = util::file_stamp(&dll);
     state.nightcoop_from_file = Some(archive.display().to_string());
     state.installed_at = Some(util::timestamp());
     state.game_build_id = game.steam.as_ref().and_then(|g| g.build_id.clone());
@@ -537,6 +550,7 @@ pub fn restore_rollback(game: &Game, snap: &Path, state: &mut InstallState, rep:
     let ver = snap.file_name().map(|n| n.to_string_lossy().split_once("__").map(|(_, v)| v.to_string()).unwrap_or_default());
     state.nightcoop_version = ver.filter(|v| v != "unknown");
     state.nightcoop_dll_sha256 = util::sha256_file(&dest.join("NightCoop.dll")).ok();
+    state.nightcoop_dll_stamp = util::file_stamp(&dest.join("NightCoop.dll"));
     let _ = fs::remove_dir_all(snap);
     rep.log("Previous NightCoop build restored.");
     Ok(())
@@ -557,6 +571,7 @@ pub fn uninstall_nightcoop(game: &Game, state: &mut InstallState, rep: &Reporter
     }
     state.nightcoop_version = None;
     state.nightcoop_dll_sha256 = None;
+    state.nightcoop_dll_stamp = None;
     rep.log("NightCoop removed. Your saves were not touched.");
     Ok(())
 }
@@ -601,6 +616,39 @@ pub fn apply_launch_option(game: &Game, enable: bool, restart_steam: bool, rep: 
         steam::start_steam(&sg.steam_root)?;
     }
     Ok(())
+}
+
+// ---------- recognising a build installed by hand ----------
+
+/// NightCoop.dll has no version resource, but it embeds its build id (e.g. `a7c537d`) as text.
+/// Matches it against the release list so a build unpacked by hand is recognised without reinstalling.
+pub fn identify_nightcoop(game: &Game, manifest: &remote::NcManifest, state: &mut InstallState) -> Option<String> {
+    let dll = game.plugin_dir().join("NightCoop.dll");
+    let bytes = fs::read(&dll).ok()?;
+    let rel = manifest.releases.iter().find(|r| {
+        r.build.as_deref().filter(|b| b.len() >= 6).is_some_and(|b| {
+            let needle = [&[0u8][..], b.as_bytes(), &[0u8][..]].concat();
+            bytes.windows(needle.len()).any(|w| w == needle.as_slice())
+        })
+    })?;
+    state.game_dir = game.dir.display().to_string();
+    state.nightcoop_version = Some(rel.version.clone());
+    state.nightcoop_dll_sha256 = util::sha256_file(&dll).ok();
+    state.nightcoop_dll_stamp = util::file_stamp(&dll);
+    Some(rel.version.clone())
+}
+
+// ---------- housekeeping ----------
+
+/// Deletes cached downloads and leftovers from interrupted installs. Backups and rollbacks stay.
+pub fn clean_cache() -> u64 {
+    let mut freed = 0;
+    for name in ["downloads", "staging"] {
+        let dir = config::data_dir().join(name);
+        freed += util::dir_size(&dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+    freed
 }
 
 // ---------- bug report ----------
@@ -705,9 +753,12 @@ mod tests {
         mods_on(&game, &rep).unwrap();
         assert!(game_dir.join("bin/x64/winmm.dll").is_file() && game.plugin_dir().join("NightCoop.dll").is_file());
         assert!(!game.park_dir().exists());
-        // Installing while mods are off brings them back first.
+        // Installing while mods are off brings them back first. Reinstalling the same build is a repair:
+        // it must not add a rollback copy of itself.
+        let rollbacks_before = list_rollbacks().len();
         mods_off(&game, &rep).unwrap();
         install_nightcoop_archive(&game, &nc2, Some("0.2.0".into()), None, &mut state, &rep).unwrap();
+        assert_eq!(list_rollbacks().len(), rollbacks_before);
         assert!(!game.park_dir().exists() && game_dir.join("bin/x64/winmm.dll").is_file());
         assert_eq!(fs::read(game.servers_file()).unwrap(), b"hub.example.org#ABCD");
         let snap = list_rollbacks().into_iter().find(|p| p.to_string_lossy().ends_with("0.1.0")).expect("rollback snapshot");
@@ -773,6 +824,11 @@ mod tests {
         assert_eq!(st.nightcoop_version.as_deref(), Some(rel.version.as_str()));
         assert!(st.loader_present && st.red4ext_version.is_some());
         assert_eq!(state.red4ext_bundled, state.red4ext_version);
+
+        // A build unpacked by hand (unknown to the helper) is recognised by the build id inside the DLL.
+        let mut fresh = InstallState::default();
+        assert_eq!(identify_nightcoop(&game, &m, &mut fresh).as_deref(), Some(rel.version.as_str()));
+        assert!(fresh.nightcoop_dll_sha256.is_some());
 
         // "My own version": NightCoop updates must leave a chosen RED4ext alone…
         fs::write(game.red4ext_dir().join("RED4ext.dll"), b"custom").unwrap();

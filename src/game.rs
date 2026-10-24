@@ -191,7 +191,8 @@ impl Status {
             // Trust our record only while the DLL is still the one we installed.
             let ours = same_dir
                 && state.nightcoop_dll_sha256.is_some()
-                && util::sha256_file(&dll).ok() == state.nightcoop_dll_sha256;
+                && ((state.nightcoop_dll_stamp.is_some() && util::file_stamp(&dll) == state.nightcoop_dll_stamp)
+                    || util::sha256_file(&dll).ok() == state.nightcoop_dll_sha256);
             s.nightcoop_version = ours
                 .then(|| state.nightcoop_version.clone())
                 .flatten()
@@ -275,8 +276,9 @@ impl Status {
         }
         line("Saves", format!("{} saves, {}", self.save_count, util::human_size(self.saves_size)));
         line("Saves folder", self.saves_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()));
-        for u in &self.users {
-            line(&format!("Launch opts [{}]", u.persona.clone().unwrap_or_else(|| u.user_id.clone())), opt(&u.launch_options));
+        // Accounts are numbered, not named: these reports get posted in public channels.
+        for (i, u) in self.users.iter().enumerate() {
+            line(&format!("Launch opts [account {}]", i + 1), opt(&u.launch_options));
         }
         line("Steam running", self.steam_running.to_string());
         line("Game running", self.game_running.to_string());
@@ -287,7 +289,15 @@ impl Status {
                 d.push('\n');
             }
         }
-        d
+        redact_home(&d)
+    }
+}
+
+/// Replaces the user's home folder (which contains their account name) with `~`.
+pub fn redact_home(text: &str) -> String {
+    match dirs::home_dir().map(|h| h.display().to_string()).filter(|h| h.len() > 3) {
+        Some(home) => text.replace(&home, "~").replace(&home.replace('\\', "/"), "~"),
+        None => text.to_string(),
     }
 }
 

@@ -30,6 +30,8 @@ one-button flow working without a terminal.
 | `src/game.rs` | Finding the game (Steam / GOG / Epic / manual) and `Status::scan` (what's installed, versions, saves, Proton, logs). |
 | `src/steam.rs` | Steam roots & libraries, `appmanifest`, launch-option merge/strip, process detection, Steam shutdown/start, Deck detection. |
 | `src/remote.rs` | Release feeds: GitHub releases API (RED4ext, helper) and `https://nightcoop.net/releases.json`. |
+| `src/invite.rs` | Finds NightCoop invites (`CODE@host[:port]#FINGERPRINT` or a bare code) in pasted text; builds the "message for my partner". |
+| `src/net.rs` | Connection check: resolves `hub.nightcoop.net`, STUN binding requests to the public servers the mod uses → UDP works? strict NAT? |
 | `src/vdf.rs` | Text KeyValues parser/writer that preserves raw escaping (round-trips Steam files). |
 | `src/shortcuts.rs` | Binary `shortcuts.vdf` reader/writer for "Add to Steam". |
 | `src/selfupdate.rs` | Helper self-update from this repo's GitHub releases. `HOME_REPO` lives here. |
@@ -68,7 +70,7 @@ one-button flow working without a terminal.
 cargo test                      # unit + fake-game install cycle (no network)
 cargo test -- --include-ignored # also installs real RED4ext and the live NightCoop build into temp folders
 cargo run                       # debug GUI
-$env:NCH_PAGE="versions"; cargo run   # open a page directly: home, versions, saves, servers, troubleshoot, guide, settings
+$env:NCH_PAGE="versions"; cargo run   # open a page directly: home, play (together), versions, saves, troubleshoot, guide, settings
 .\build.ps1                     # full release build into dist\
 ```
 
@@ -114,6 +116,14 @@ print([t.needed for s in f.iter_sections() if s.name == ".dynamic" for t in s.it
   DLL's SHA-256 matches). A build installed outside the helper shows "unknown version" and is offered as an update.
 - Versions use semver pre-releases: `0.1.0` > `0.1.0-beta.2` > `0.1.0-beta.1` (`util::cmp_versions`).
 - `game` entries are matched against the exe's ProductVersion (`2.5` here) with `util::version_covers`.
+- `NightCoop.dll` embeds its **build id** as a NUL-terminated string followed by the build date
+  (`\0a7c537d\0Oct 23 2026 17:26:20`). `ops::identify_nightcoop` matches it against the feed's `build` field, so a build
+  unpacked by hand gets its version without a reinstall (run during update checks and setup when the version is unknown).
+- The DLL also names `hub.nightcoop.net` (official hub, UDP 47800) and public STUN servers (Google, Cloudflare, Twilio, Nextcloud).
+  The hub speaks encrypted ENet — don't try to ping it; the connection check uses STUN only.
+- Self-hosted hubs: https://github.com/Twenfys/nightcoop-hub (UDP 47800 + 47810–47873, address `host#FINGERPRINT`).
+- The **clipboard needs eframe's `clipboard` feature** (it is not on by default with `default-features = false`). Without it every
+  Copy button and Ctrl+V silently does nothing — this shipped broken in 0.1.0–0.3.1.
 
 `cargo test -- --include-ignored` runs `real_nightcoop_install`, which installs the live latest build into a temp folder.
 
@@ -127,6 +137,14 @@ print([t.needed for s in f.iter_sections() if s.name == ".dynamic" for t in s.it
   controller-friendly focus navigation for Gaming Mode, identify manually installed builds by hashing the DLL inside cached zips.
 
 ## Changelog
+
+- **0.4.0** — New **Play together** page: paste a partner's versions/invite/message → match verdict, one-click switch to their
+  build, decoded invite with Copy; "message for my partner"; STUN connection check; Deck paste (Ctrl+V back-button) tip;
+  servers.txt editor moved here with the self-host link. Fixes: **copy/paste never worked** (missing eframe clipboard feature);
+  repairs no longer push real builds out of the rollback list; diagnostics/bug reports hide account names and the home path.
+  Builds unpacked by hand are recognised by their embedded build id. Automatic backups are skipped when saves didn't change;
+  the 15 MB DLL isn't re-hashed on every refresh; the three update lookups run in parallel; Settings shows data usage with a
+  "Clear download cache" button.
 
 - **0.3.1** — "Remove everything" clears the Proton launch option when *any* Steam account on the device has it
   (it used to require every account, so a Deck with two accounts could keep it).

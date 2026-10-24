@@ -275,6 +275,33 @@ pub fn pe_version(path: &Path) -> Option<String> {
     Some(format!("{}.{}.{}.{}", v.Major, v.Minor, v.Patch, v.Build))
 }
 
+/// "size:modified-seconds" of a file: a cheap stand-in for hashing it again.
+pub fn file_stamp(path: &Path) -> Option<String> {
+    let m = fs::metadata(path).ok()?;
+    let secs = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    Some(format!("{}:{secs}", m.len()))
+}
+
+/// Number of files, total size and newest change below `dir`, to notice whether anything changed.
+pub fn dir_fingerprint(dir: &Path) -> Option<String> {
+    let (mut files, mut size, mut newest) = (0u64, 0u64, 0u64);
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).ok()?.flatten() {
+            let m = e.metadata().ok()?;
+            if m.is_dir() {
+                stack.push(e.path());
+            } else {
+                files += 1;
+                size += m.len();
+                let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+                newest = newest.max(t);
+            }
+        }
+    }
+    Some(format!("{files}:{size}:{newest}"))
+}
+
 pub fn timestamp() -> String {
     chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string()
 }

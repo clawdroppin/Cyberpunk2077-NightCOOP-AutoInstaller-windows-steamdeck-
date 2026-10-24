@@ -5,7 +5,7 @@ use crate::game::{self, Status};
 use crate::ops::{self, Event, Reporter};
 use crate::remote::{self, GhRelease, NcManifest};
 use crate::selfupdate::{self, HelperUpdate};
-use crate::{shortcuts, steam, util};
+use crate::{invite, net, shortcuts, steam, util};
 use anyhow::{anyhow, Result};
 use eframe::egui::{self, Color32, RichText};
 use std::path::PathBuf;
@@ -25,20 +25,20 @@ enum Page {
     Home,
     Versions,
     Saves,
-    Servers,
+    Together,
     Troubleshoot,
     Guide,
     Settings,
 }
 
 impl Page {
-    const ALL: [Page; 7] = [Page::Home, Page::Versions, Page::Saves, Page::Servers, Page::Troubleshoot, Page::Guide, Page::Settings];
+    const ALL: [Page; 7] = [Page::Home, Page::Together, Page::Versions, Page::Saves, Page::Troubleshoot, Page::Guide, Page::Settings];
     fn label(self) -> &'static str {
         match self {
             Page::Home => "🏠  Home",
             Page::Versions => "📦  Mods & Versions",
             Page::Saves => "💾  Saves",
-            Page::Servers => "🌐  Servers",
+            Page::Together => "👥  Play together",
             Page::Troubleshoot => "🔧  Troubleshoot",
             Page::Guide => "🎮  Deck Guide",
             Page::Settings => "⚙  Settings",
@@ -59,6 +59,7 @@ enum Extra {
     Remote(RemoteInfo),
     OpenFolderOf(PathBuf),
     HelperUpdated,
+    Connection(net::CheckResult),
 }
 
 struct JobDone {
@@ -106,6 +107,11 @@ pub struct App {
     last_poll: Instant,
     helper_restart_ready: bool,
     partner_text: String,
+    /// The invite the host pasted, to send along with their versions.
+    my_invite: String,
+    connection: Option<net::CheckResult>,
+    /// Sizes of backups / rollbacks / download cache, computed when Settings is first shown.
+    data_sizes: Option<(u64, u64, u64)>,
     /// Any Steam install found (cached; looking it up hits the disk).
     steam_found: bool,
 }
@@ -136,6 +142,9 @@ impl App {
             last_poll: Instant::now(),
             helper_restart_ready: false,
             partner_text: String::new(),
+            my_invite: String::new(),
+            connection: None,
+            data_sizes: None,
             steam_found: !steam::steam_roots().is_empty(),
         };
         // NCH_PAGE=versions|saves|… opens a page directly (handy for screenshots and testing).
@@ -213,9 +222,10 @@ impl App {
                                 }
                             }
                             Extra::HelperUpdated => self.helper_restart_ready = true,
+                            Extra::Connection(r) => self.connection = Some(r),
                             Extra::None => {}
                         }
-                        if job.title != "Checking for updates" {
+                        if job.title != "Checking for updates" && job.title != "Checking the connection" {
                             self.banner = Some((true, format!("{} — done.", job.title)));
                         }
                     }
@@ -253,13 +263,27 @@ impl App {
         if !self.servers_dirty {
             self.servers_text = None;
         }
+        self.data_sizes = None;
     }
 
     fn check_updates(&mut self, ctx: &egui::Context) {
-        self.spawn(ctx, "Checking for updates", |rep, _state, settings| {
-            rep.progress(None, "Checking RED4ext, NightCoop and helper versions…");
-            Ok(Extra::Remote(fetch_remote(settings)))
+        let unknown = self.unknown_build();
+        self.spawn(ctx, "Checking for updates", move |rep, state, settings| {
+            rep.progress(None, "Checking NightCoop, RED4ext and helper versions…");
+            let info = fetch_remote(settings);
+            if let (Some(game), Some(Ok(m))) = (&unknown, &info.nightcoop) {
+                if let Some(v) = ops::identify_nightcoop(game, m, state) {
+                    rep.log(format!("Recognised the installed NightCoop as {v}."));
+                }
+            }
+            Ok(Extra::Remote(info))
         });
+    }
+
+    /// The game, when NightCoop is installed but the helper doesn't know which build it is.
+    fn unknown_build(&self) -> Option<game::Game> {
+        let unknown = self.status.nightcoop_installed && self.status.nightcoop_version.as_deref().map(|v| v.starts_with("unknown")).unwrap_or(true);
+        unknown.then(|| self.status.game.clone()).flatten()
     }
 
     // ---------- derived info ----------
@@ -331,9 +355,15 @@ impl App {
             }
             rep.log("Checking for the latest versions…");
             let info = fetch_remote(settings);
+            let mut nc_installed_version = nc_installed_version;
+            if let Some(Ok(m)) = &info.nightcoop {
+                if nc_installed_version.as_deref().map(|v| v.starts_with("unknown")).unwrap_or(false) {
+                    nc_installed_version = ops::identify_nightcoop(&game, m, state);
+                }
+            }
 
             if settings.backup_saves_before_install {
-                ops::backup_saves(&game, settings, state, rep, "before-install")?;
+                ops::backup_saves(&game, settings, state, rep, "before-install", true)?;
             }
 
             // NightCoop first: each build ships the RED4ext it was tested with.
@@ -654,9 +684,8 @@ impl App {
             if ui.button("↻  Refresh status").clicked() {
                 self.rescan();
             }
-            if ui.button("📋  Copy my versions").on_hover_text("Send this to your co-op partner: everyone needs the same build").clicked() {
-                ui.ctx().copy_text(self.share_text());
-                self.banner = Some((true, "Versions copied — paste them to your partner to compare.".into()));
+            if ui.button("👥  Play together").on_hover_text("Check you and your partner match, share invites, test your connection").clicked() {
+                self.page = Page::Together;
             }
             let installed = (self.status.red4ext_version.is_some() || self.status.nightcoop_installed) && !self.status.mods_off;
             if installed
@@ -668,25 +697,6 @@ impl App {
                 if let Some(g) = self.status.game.clone() {
                     self.spawn(&ctx, "Turning mods off", move |rep, _, _| ops::mods_off(&g, rep).map(|_| Extra::None));
                 }
-            }
-        });
-        egui::CollapsingHeader::new("👥  Compare with my partner").show(ui, |ui| {
-            ui.label(RichText::new("Paste the text your partner copied with “Copy my versions”:").color(DIM));
-            ui.add(egui::TextEdit::singleline(&mut self.partner_text).desired_width(f32::INFINITY).hint_text("NightCoop 0.1.0 · RED4ext 1.30.0 · Game 2.5 · Phantom Liberty: yes"));
-            if !self.partner_text.trim().is_empty() {
-                for (label, mine, theirs, same) in compare_versions(&self.share_text(), &self.partner_text) {
-                    let (icon, color) = match (&theirs, same) {
-                        (Some(_), true) => ("✔", OK),
-                        (Some(_), false) => ("✖", BAD),
-                        (None, _) => ("●", DIM),
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(icon).color(color));
-                        ui.label(RichText::new(label).strong());
-                        ui.label(RichText::new(format!("you: {mine}   partner: {}", theirs.unwrap_or_else(|| "?".into()))).color(DIM));
-                    });
-                }
-                ui.label(RichText::new("NightCoop builds with the same protocol play together; the game version and Phantom Liberty should match too.").color(DIM).small());
             }
         });
         if let Some(t) = &self.remote.checked_at {
@@ -706,7 +716,7 @@ impl App {
         }
         if self.status.ready() {
             ui.add_space(6.0);
-            info_card(ui, "Ready! In the game's main menu open Co-op → Host a session, then send the invite to your partner. Guests use Co-op → Join by code.");
+            info_card(ui, "Ready! Open 👥 Play together to check you and your partner match, then: Co-op → Host a session (host) or Co-op → Join by code (guest).");
         }
 
         ui.add_space(10.0);
@@ -1002,7 +1012,7 @@ impl App {
             ui.horizontal(|ui| {
                 if ui.add_enabled(!self.busy(), egui::Button::new(RichText::new("💾  Back up now").strong())).clicked() {
                     let g = game.clone();
-                    self.spawn(&ctx, "Backing up saves", move |rep, state, settings| ops::backup_saves(&g, settings, state, rep, "").map(|_| Extra::None));
+                    self.spawn(&ctx, "Backing up saves", move |rep, state, settings| ops::backup_saves(&g, settings, state, rep, "", false).map(|_| Extra::None));
                 }
                 if let Some(d) = &self.status.saves_dir {
                     if ui.button("Open saves folder").clicked() {
@@ -1096,34 +1106,181 @@ impl App {
         });
     }
 
-    fn servers(&mut self, ui: &mut egui::Ui) {
-        ui.heading(RichText::new("Servers").size(28.0).strong());
-        ui.label(RichText::new(
-            "By default the mod picks the nearest official server. A custom server is normally added in-game \
-             (Co-op → Server → Add an own server) using an address with a key fingerprint, like hub.example.org#K3QF-9X2M-TV7A-0D4R. \
-             The choice is stored in servers.txt next to NightCoop.dll — you can view or copy it here.",
-        )
-        .color(DIM));
-        let Some(game) = self.status.game.clone() else {
-            warn_card(ui, "Game not found.");
-            return;
-        };
-        if !self.status.nightcoop_installed {
-            info_card(ui, "Install NightCoop first; servers.txt lives in its folder.");
-            return;
-        }
-        let file = game.servers_file();
-        if self.servers_text.is_none() {
-            self.servers_text = Some(std::fs::read_to_string(&file).unwrap_or_default());
-            self.servers_dirty = false;
-        }
+    fn together(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.heading(RichText::new("Play together").size(28.0).strong());
+        ui.label(RichText::new("Everything for getting into the same session: matching versions, invites and a connection check.").color(DIM));
+        ui.add_space(6.0);
+        let mine = self.share_text();
+
+        // 1 · matching versions
         card(ui, |ui| {
-            ui.label(RichText::new(file.display().to_string()).monospace().color(DIM).small());
+            ui.label(RichText::new("1 · SAME BUILD ON BOTH SIDES").color(ACCENT).strong());
+            ui.label("Builds with the same protocol number play together. Send your partner your versions, paste theirs below.");
+            ui.label(RichText::new(&mine).monospace().color(CYAN));
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("📋  Copy my versions").clicked() {
+                    ui.ctx().copy_text(mine.clone());
+                    self.banner = Some((true, "Versions copied — send them to your partner.".into()));
+                }
+                if ui.button("✉  Copy a message for my partner").on_hover_text("Your versions plus the invite (if you pasted one below), ready to send in any chat").clicked() {
+                    let inv = invite::find(&self.my_invite);
+                    ui.ctx().copy_text(invite::join_message(inv.as_ref(), &mine));
+                    self.banner = Some((true, "Message copied — paste it in Discord, Steam chat or a text message.".into()));
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(RichText::new("What your partner sent you (their versions, their invite, or their whole message):").color(DIM));
+            ui.add(egui::TextEdit::multiline(&mut self.partner_text).desired_rows(3).desired_width(f32::INFINITY).hint_text("Paste here (Ctrl+V)"));
+            let partner = self.partner_text.trim().to_string();
+            if !partner.is_empty() {
+                let rows = compare_versions(&mine, &partner);
+                let known = rows.iter().any(|r| r.2.is_some());
+                if known {
+                    // Same protocol is what decides; without it, the NightCoop version.
+                    let verdict = if !self.status.nightcoop_installed {
+                        None
+                    } else {
+                        rows.iter()
+                            .find(|r| r.0 == "Protocol" && r.2.is_some() && !r.1.is_empty())
+                            .or_else(|| rows.iter().find(|r| r.0 == "NightCoop" && r.2.is_some()))
+                            .map(|r| r.3)
+                    };
+                    match verdict {
+                        Some(true) => ui.label(RichText::new("✔  Your NightCoop builds match — you can play together.").color(OK).strong()),
+                        Some(false) => ui.label(RichText::new("✖  Your NightCoop builds don't match — one of you needs to switch.").color(BAD).strong()),
+                        None if !self.status.nightcoop_installed => ui.label(RichText::new("●  You don't have NightCoop yet — install their build below.").color(WARN).strong()),
+                        None => ui.label(RichText::new("●  Couldn't find their NightCoop version in that text.").color(WARN)),
+                    };
+                    for (label, mine_v, theirs, same) in &rows {
+                        let (icon, color) = match (theirs, same) {
+                            (Some(_), true) => ("✔", OK),
+                            (Some(_), false) => ("✖", if *label == "RED4ext" { WARN } else { BAD }),
+                            (None, _) => ("●", DIM),
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(icon).color(color));
+                            ui.label(RichText::new(*label).strong());
+                            ui.label(RichText::new(format!("you: {}   partner: {}", if mine_v.is_empty() { "?" } else { mine_v }, theirs.as_deref().unwrap_or("?"))).color(DIM));
+                        });
+                    }
+                    // One click to switch to the partner's build when it is listed.
+                    let theirs_nc = rows.iter().find(|r| r.0 == "NightCoop").and_then(|r| r.2.clone());
+                    if let (Some(t), Some(Ok(m))) = (theirs_nc, &self.remote.nightcoop) {
+                        let differs = !self.status.nightcoop_version.as_deref().map(|v| util::same_version(v, &t)).unwrap_or(false);
+                        if differs {
+                            if let Some(rel) = m.releases.iter().find(|r| util::same_version(&r.version, &t)) {
+                                let v = rel.version.clone();
+                                let label = if self.status.nightcoop_installed { format!("⬇  Switch to their build (v{v})") } else { format!("⬇  Install their build (v{v})") };
+                                if ui.add_enabled(!self.busy() && self.status.game.is_some(), egui::Button::new(label)).clicked() {
+                                    self.confirm = Some(Confirm::InstallNcVersion(v));
+                                }
+                            } else {
+                                ui.label(RichText::new("Their build isn't on the official list — maybe a newer one: both press ⟳ Check for updates and install the latest.").color(DIM).small());
+                            }
+                        }
+                    }
+                    if rows.iter().any(|r| r.0 == "Phantom Liberty" && r.2.is_some() && !r.3) {
+                        ui.label(RichText::new("Phantom Liberty differs: host from a save that doesn't need the expansion.").color(WARN).small());
+                    }
+                }
+                if let Some(inv) = invite::find(&partner) {
+                    ui.separator();
+                    ui.label(RichText::new("INVITE FOUND").color(ACCENT).strong());
+                    invite_details(ui, &inv);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("📋  Copy invite").clicked() {
+                            ui.ctx().copy_text(inv.line());
+                            self.banner = Some((true, "Invite copied — in the game: Co-op → Join by code → paste.".into()));
+                        }
+                        if ui.button("📋  Copy just the code").clicked() {
+                            ui.ctx().copy_text(inv.code.clone());
+                        }
+                    });
+                    ui.label(RichText::new("In the game: Co-op → Join by code → paste (Ctrl+V). On the Deck, see the paste tip below.").color(DIM).small());
+                } else if !known {
+                    ui.label(RichText::new("Nothing recognised yet — paste their versions (from “Copy my versions”) or an invite like ABC234@hub.example.org#K3QF-….").color(DIM));
+                }
+            }
+        });
+
+        // 2 · host and guest
+        card(ui, |ui| {
+            ui.label(RichText::new("2 · START THE SESSION").color(ACCENT).strong());
+            ui.label(RichText::new("Host").strong().color(CYAN));
+            ui.label("• Co-op → Host a session. Pick the world save everyone plays in (your save drives quests and the city), or New game.");
+            ui.label("• Press “Copy the invite” in the lobby and send it. Everyone marks Ready.");
+            ui.label("Paste your invite here to send it together with your versions (✉ button above):");
+            ui.add(egui::TextEdit::singleline(&mut self.my_invite).desired_width(f32::INFINITY).hint_text("ABC234@…"));
+            if let Some(inv) = invite::find(&self.my_invite) {
+                invite_details(ui, &inv);
+            } else if !self.my_invite.trim().is_empty() {
+                ui.label(RichText::new("That doesn't look like an invite yet.").color(WARN).small());
+            }
+            ui.add_space(4.0);
+            ui.label(RichText::new("Guest").strong().color(CYAN));
+            ui.label("• Co-op → Join by code → paste the invite (or type the code). You arrive in the host's world as your own V — your own saves are never changed.");
+            ui.label("• Choices in dialogue go to a vote; fights and cutscenes are shared; a downed partner can be helped up.");
+        });
+
+        // 3 · connection check
+        card(ui, |ui| {
+            ui.label(RichText::new("3 · CONNECTION CHECK").color(ACCENT).strong());
+            ui.label(RichText::new("Checks that NightCoop's server can be found and that your network lets the game's UDP traffic out. Takes a few seconds; nothing personal is sent.").color(DIM));
+            if ui.add_enabled(!self.busy(), egui::Button::new("📡  Check my connection")).clicked() {
+                self.spawn(&ctx, "Checking the connection", |rep, _, _| {
+                    rep.progress(None, "Checking the connection…");
+                    Ok(Extra::Connection(net::connection_check()))
+                });
+            }
+            if let Some(r) = &self.connection {
+                let good = r.hub_resolves && r.udp_works;
+                ui.label(RichText::new(r.summary()).color(if !good { BAD } else if r.nat == net::Nat::Friendly { OK } else { WARN }).strong());
+                check_row(ui, Some(r.hub_resolves), "NightCoop server found", if r.hub_resolves { "the name resolves" } else { "can't look up hub.nightcoop.net" });
+                check_row(ui, Some(r.udp_works), "UDP gets out", if r.udp_works { "the game's traffic can leave your network" } else { "blocked or no internet" });
+                let (ok, text) = match r.nat {
+                    net::Nat::Friendly => (Some(true), "direct connections likely"),
+                    net::Nat::Strict => (None, "strict router — the relay will be used"),
+                    net::Nat::Unknown => (None, "couldn't tell"),
+                };
+                check_row(ui, ok, "Router", text);
+                ui.label(RichText::new("Both of you can run this. If only one side fails, that network is the problem.").color(DIM).small());
+            }
+        });
+
+        // 4 · Deck tips
+        card(ui, |ui| {
+            ui.label(RichText::new("STEAM DECK TIPS").color(ACCENT).strong());
+            ui.label("• Paste an invite in Gaming Mode: map a back button to Ctrl+V once — Cyberpunk → 🎮 controller icon → Edit layout → Back grip buttons → L4 → Keyboard → V, then add a second command on the same button: Left Ctrl.");
+            ui.label("• On-screen keyboard: STEAM + X. You can also just type the session code (e.g. ABC234); a private server needs the full invite.");
+        });
+
+        // 5 · servers
+        let game = self.status.game.clone();
+        egui::CollapsingHeader::new(RichText::new("🌐  Servers (advanced)").color(DIM)).show(ui, |ui| {
+            ui.label(RichText::new(
+                "By default the mod picks the nearest official server. A private server is added in-game (Co-op → Server → Add an own server) \
+                 with an address and key fingerprint, like hub.example.org#K3QF-9X2M-TV7A-0D4R. Your list lives in servers.txt next to NightCoop.dll.",
+            )
+            .color(DIM));
+            if ui.link("Run your own server (official guide)").clicked() {
+                util::open_path("https://github.com/Twenfys/nightcoop-hub");
+            }
+            let Some(game) = game else { return };
+            if !self.status.nightcoop_installed {
+                ui.label(RichText::new("Install NightCoop first; servers.txt lives in its folder.").color(DIM));
+                return;
+            }
+            let file = game.servers_file();
+            if self.servers_text.is_none() {
+                self.servers_text = Some(std::fs::read_to_string(&file).unwrap_or_default());
+                self.servers_dirty = false;
+            }
             if !file.exists() {
                 ui.label(RichText::new("No servers.txt yet — it appears after you pick a server in-game.").color(DIM));
             }
             let text = self.servers_text.as_mut().unwrap();
-            if ui.add(egui::TextEdit::multiline(text).code_editor().desired_rows(10).desired_width(f32::INFINITY)).changed() {
+            if ui.add(egui::TextEdit::multiline(text).code_editor().desired_rows(6).desired_width(f32::INFINITY)).changed() {
                 self.servers_dirty = true;
             }
             ui.horizontal(|ui| {
@@ -1145,7 +1302,6 @@ impl App {
                 }
             });
         });
-        info_card(ui, "Joining a friend: the host presses “Copy the invite” in the session lobby (a line like ABC234@hub.example.org#K3QF-…). The guest pastes it into Co-op → Join by code.");
     }
 
     fn troubleshoot(&mut self, ui: &mut egui::Ui) {
@@ -1190,7 +1346,7 @@ impl App {
             let items: [(&str, &str); 8] = [
                 ("No “Co-op” item in the main menu", "RED4ext didn't load the plugin. Check the diagnostics above: RED4ext and NightCoop must be installed, and on Steam Deck/Linux the Proton launch option must be set. The RED4ext log says why a plugin was skipped."),
                 ("Worked before, broke after a game update", "Cyberpunk patches break RED4ext and plugins until they're updated. Press “Check for updates”, then “Update everything”. NightCoop lists the game versions each build supports."),
-                ("Can't join each other", "Everyone must run the same NightCoop build (same protocol number). Use “Copy my versions” on Home and compare."),
+                ("Can't join each other", "Open 👥 Play together: paste your partner's versions to check the builds match (same protocol number), and both run the connection check — if only one side fails, that network is the problem (school/work Wi-Fi often blocks UDP)."),
                 ("Game crashes on start (Deck)", "Try Proton Experimental or the latest Proton in Cyberpunk → Properties → Compatibility. As a last resort install vcrun2022 with Protontricks."),
                 ("Stutter every few seconds", "Use Borderless window instead of exclusive fullscreen, and turn off the Discord overlay / frame generation."),
                 ("“Server failed the key check”", "The server fingerprint doesn't match: a typo or the owner made a new key. Ask them for the current address#fingerprint."),
@@ -1225,8 +1381,8 @@ impl App {
             ("1. Use Desktop Mode for setup", "Steam button → Power → Switch to Desktop. The helper can then change Steam's launch options for you (Steam restarts once)."),
             ("2. Press “Install everything”", "It backs up your saves, installs RED4ext and NightCoop, and sets the Proton DLL override. Press it again whenever an update is out."),
             ("3. Back to Gaming Mode", "Use the “Return to Gaming Mode” icon on the desktop and start Cyberpunk 2077 as usual."),
-            ("4. Host or join", "Main menu → Co-op. The host picks Host a session and copies the invite; the guest chooses Join by code and pastes it."),
-            ("Typing the code", "Press STEAM + X for the on-screen keyboard. To paste an invite, the guest can also type the short session code."),
+            ("4. Host or join", "Open 👥 Play together first to check you both match. In the game: Main menu → Co-op. The host picks Host a session and copies the invite; the guest chooses Join by code and pastes it."),
+            ("Pasting an invite", "Map a back button to Ctrl+V once (controller layout → L4 → Keyboard V, plus a second command Left Ctrl) and pasting is one press. Or press STEAM + X and type the short session code."),
             ("Menu hotkeys", "If you need a keyboard key in-game, map a back button (L4/R4) to it: Steam button → Controller settings → Edit layout."),
         ];
         for (t, d) in steps {
@@ -1342,7 +1498,23 @@ impl App {
                     changed = true;
                 }
             });
-            ui.label(RichText::new(format!("Helper data: {}", config::data_dir().display())).color(DIM).small());
+            ui.label(RichText::new(format!("Helper data: {}", game::redact_home(&config::data_dir().display().to_string()))).color(DIM).small());
+            ui.horizontal_wrapped(|ui| {
+                let sizes = self.data_sizes.get_or_insert_with(data_sizes);
+                ui.label(RichText::new(format!(
+                    "Save backups {} · previous builds {} · download cache {}",
+                    util::human_size(sizes.0),
+                    util::human_size(sizes.1),
+                    util::human_size(sizes.2)
+                ))
+                .color(DIM)
+                .small());
+                if ui.add_enabled(!self.busy(), egui::Button::new("🧹  Clear download cache")).on_hover_text("Backups and previous builds are kept").clicked() {
+                    let freed = ops::clean_cache();
+                    self.data_sizes = None;
+                    self.banner = Some((true, format!("Freed {}.", util::human_size(freed))));
+                }
+            });
         });
         if changed {
             self.settings.save();
@@ -1501,7 +1673,7 @@ impl App {
                 if let (Some(g), Some(rel)) = (game, rel) {
                     self.spawn(ctx, &format!("Installing NightCoop {v}"), move |rep, state, settings| {
                         if settings.backup_saves_before_install {
-                            ops::backup_saves(&g, settings, state, rep, "before-install")?;
+                            ops::backup_saves(&g, settings, state, rep, "before-install", true)?;
                         }
                         ops::install_nightcoop_release(&g, &rel, &settings.manifest_url, state, rep).map(|_| Extra::None)
                     });
@@ -1530,12 +1702,27 @@ impl App {
 
 /// Lines up the fields of two "Copy my versions" texts: (label, mine, theirs, matching).
 fn compare_versions(mine: &str, theirs: &str) -> Vec<(&'static str, String, Option<String>, bool)> {
+    /// Finds "<key> <value>" anywhere in the text (start of a part or after a space, "(" or ":"),
+    /// keeping only values that look like what that key holds, so "NightCoop Helper" is not a version.
     fn field(text: &str, key: &str) -> Option<String> {
+        let plausible = |v: &str| {
+            let v = v.trim_start_matches(['v', 'V']);
+            key == "Phantom Liberty" && matches!(v.to_ascii_lowercase().as_str(), "yes" | "no")
+                || v.starts_with(|c: char| c.is_ascii_digit())
+                || ["not installed", "unknown", "?"].iter().any(|w| v.to_ascii_lowercase().starts_with(w))
+        };
+        let lower_key = key.to_ascii_lowercase();
         text.split(['·', '|', '\n']).find_map(|part| {
-            let part = part.trim();
-            part.get(..key.len())
-                .filter(|p| p.eq_ignore_ascii_case(key))
-                .map(|_| part[key.len()..].trim().trim_start_matches(':').trim().to_string())
+            let lower = part.to_ascii_lowercase();
+            lower.match_indices(&lower_key).find_map(|(i, _)| {
+                let boundary = i == 0 || lower[..i].ends_with([' ', '(', ':', '\t']);
+                let rest = &part[i + key.len()..];
+                if !boundary || !rest.starts_with([' ', ':']) {
+                    return None;
+                }
+                let value = rest.trim_start_matches([' ', ':']).trim().to_string();
+                (!value.is_empty() && plausible(&value)).then_some(value)
+            })
         })
     }
     ["NightCoop", "Protocol", "RED4ext", "Game", "Phantom Liberty"]
@@ -1552,11 +1739,20 @@ fn compare_versions(mine: &str, theirs: &str) -> Vec<(&'static str, String, Opti
         .collect()
 }
 
+fn data_sizes() -> (u64, u64, u64) {
+    let d = config::data_dir();
+    (util::dir_size(&d.join("backups")), util::dir_size(&d.join("rollback")), util::dir_size(&d.join("downloads")) + util::dir_size(&d.join("staging")))
+}
+
 fn fetch_remote(settings: &Settings) -> RemoteInfo {
-    let red4ext = Some(remote::github_releases(remote::RED4EXT_REPO).map_err(|e| format!("{e:#}")));
-    let nightcoop = Some(remote::nightcoop_manifest(&settings.manifest_url).map_err(|e| format!("{e:#}")));
     let repo = settings.helper_repo.trim();
-    let helper = (!repo.is_empty()).then(|| selfupdate::check(repo).map_err(|e| format!("{e:#}")));
+    let (red4ext, nightcoop, helper) = std::thread::scope(|sc| {
+        let r4 = sc.spawn(|| remote::github_releases(remote::RED4EXT_REPO).map_err(|e| format!("{e:#}")));
+        let nc = sc.spawn(|| remote::nightcoop_manifest(&settings.manifest_url).map_err(|e| format!("{e:#}")));
+        let hp = sc.spawn(|| (!repo.is_empty()).then(|| selfupdate::check(repo).map_err(|e| format!("{e:#}"))));
+        let failed = "the check stopped unexpectedly".to_string();
+        (Some(r4.join().unwrap_or_else(|_| Err(failed.clone()))), Some(nc.join().unwrap_or_else(|_| Err(failed))), hp.join().unwrap_or(None))
+    });
     RemoteInfo { red4ext, nightcoop, helper, checked_at: Some(chrono::Local::now().format("%Y-%m-%d %H:%M").to_string()) }
 }
 
@@ -1585,7 +1781,7 @@ impl eframe::App for App {
                     Page::Home => self.home(ui),
                     Page::Versions => self.versions(ui),
                     Page::Saves => self.saves(ui),
-                    Page::Servers => self.servers(ui),
+                    Page::Together => self.together(ui),
                     Page::Troubleshoot => self.troubleshoot(ui),
                     Page::Guide => self.guide(ui),
                     Page::Settings => self.settings_page(ui),
@@ -1658,6 +1854,22 @@ fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
         });
 }
 
+fn invite_details(ui: &mut egui::Ui, inv: &invite::Invite) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Code").strong());
+        ui.label(RichText::new(&inv.code).monospace().size(18.0).color(CYAN));
+    });
+    let server = match (&inv.server, &inv.fingerprint) {
+        (None, _) => "official servers".to_string(),
+        (Some(s), Some(_)) => format!("{s} (private, key fingerprint included — verified)"),
+        (Some(s), None) => format!("{s} (private, no fingerprint — connects but can't verify the server)"),
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Server").strong());
+        ui.label(RichText::new(server).color(DIM));
+    });
+}
+
 /// One status line: ✔ (Some(true)), ✖ (Some(false)) or ● attention (None).
 fn check_row(ui: &mut egui::Ui, ok: Option<bool>, title: &str, detail: &str) {
     ui.horizontal_wrapped(|ui| {
@@ -1687,5 +1899,12 @@ mod tests {
         let old = compare_versions(mine, "NightCoop 0.1.0-beta.1 · RED4ext 1.30.0 · Game 2.5 · Phantom Liberty: yes");
         assert!(old[1].2.is_none() && old[0].3);
         assert!(compare_versions(mine, "hello").iter().all(|x| x.2.is_none()));
+        // The partner message from "Copy a message for my partner" is understood too.
+        let msg = crate::invite::join_message(None, "NightCoop 0.1.0-beta.1 · Protocol 128 · RED4ext 1.30.0 · Game 2.5 · Phantom Liberty: yes");
+        let r = compare_versions(mine, &msg);
+        assert!(r.iter().all(|x| x.2.is_some() && x.3), "{r:?}");
+        let one_line = compare_versions(mine, "Invite: QX72KD@hub.example.org#K3QF-9X2M  My versions: NightCoop 0.1.0-beta.1 · Protocol 128");
+        assert_eq!(one_line[0].2.as_deref(), Some("0.1.0-beta.1"));
+        assert!(compare_versions(mine, "open NightCoop Helper and Play together")[0].2.is_none());
     }
 }

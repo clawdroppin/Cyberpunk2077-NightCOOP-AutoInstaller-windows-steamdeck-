@@ -50,7 +50,9 @@ Press the same button again whenever an update is out — it only replaces what 
 - 📂 **Install from file** — `.zip` / `.7z` builds shared on Discord, even with an extra wrapper folder
 - 🔌 **Mods off / on** — one tap on Home for an unmodded game; everything is kept and the helper offers to turn mods back on whenever you open it again
 - ⚠ **Game-update alert** — warns when a Cyberpunk patch arrived after the mods were installed (the usual reason mods suddenly stop working)
-- 👥 **Compare with my partner** — paste their versions and see ✔/✖ for NightCoop, protocol, RED4ext, game and Phantom Liberty
+- 👥 **Play together page** — paste whatever your partner sent (their versions, their invite, or the helper's ready-made message) and get a clear ✔/✖ verdict, a **one-click switch to their build**, and the invite decoded with a Copy button
+- 📡 **Connection check** — tests that NightCoop's server can be found, that UDP traffic gets out, and whether your router allows direct connections or the mod will use its relay
+- ✉ **Message for my partner** — your versions plus your invite in one text, ready for Discord / Steam chat
 - 🌐 **Keeps your `servers.txt`** across updates; view, edit and copy it
 - 🐞 **Bug report zip** — RED4ext + NightCoop logs and a diagnostics summary in one file
 - 📋 **Copy my versions** — paste to your partner to confirm you run the same build
@@ -60,8 +62,9 @@ Press the same button again whenever an update is out — it only replaces what 
 - 🖐 Big, touch-friendly UI sized for the Deck's 1280×800 screen, adjustable scale
 
 <div align="center">
-<img src="docs/screenshots/mods.png" alt="Mods and versions page" width="49%">
-<img src="docs/screenshots/guide.png" alt="Steam Deck guide page" width="49%">
+<img src="docs/screenshots/together.png" alt="Play together page" width="32%">
+<img src="docs/screenshots/mods.png" alt="Mods and versions page" width="32%">
+<img src="docs/screenshots/guide.png" alt="Steam Deck guide page" width="32%">
 </div>
 
 ---
@@ -101,10 +104,15 @@ Press **🔌 Mods off** on the Home page. RED4ext and NightCoop are moved aside,
 
 ## 🤝 Playing together
 
-- **Everyone needs the same NightCoop build** (builds with the same *protocol* number play together). Use **📋 Copy my versions** on the Home page and compare.
-- **Host:** Co-op → Host a session → pick a save or New game → **Copy the invite** and send it.
-- **Guest:** Co-op → Join by code → paste the invite.
+Open **👥 Play together** in the helper — it walks you through it:
+
+1. **Same build on both sides.** Builds with the same *protocol* number play together. Press **✉ Copy a message for my partner** and send it; your partner pastes it into their helper and sees right away whether you match. If not, **Switch to their build** fixes it in one click.
+2. **Host:** Co-op → Host a session → pick the world save everyone plays in (the host's save drives quests and the city) or New game → **Copy the invite** in the lobby. Paste it into the helper to send it along with your versions.
+3. **Guest:** Co-op → Join by code → paste the invite (or type the session code). You join as your own V; your own saves are never changed.
+4. Trouble connecting? Both run **📡 Check my connection**. If only one side fails, that network is the problem (school, work and hotel Wi-Fi often block UDP).
+
 - Saves made with **Phantom Liberty** won't load in a session hosted without it.
+- **Steam Deck: paste with one button.** In Cyberpunk's controller layout, bind a back button (e.g. L4) to **V** and add a second command **Left Ctrl** — that's Ctrl+V for pasting invites. STEAM + X opens the on-screen keyboard.
 - Tip from the NightCoop docs: play in **Borderless window**; exclusive fullscreen freezes for a second on Alt+Tab.
 
 ## 🛠 Troubleshooting

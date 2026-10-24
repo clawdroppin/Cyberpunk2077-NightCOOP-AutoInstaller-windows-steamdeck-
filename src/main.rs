@@ -3,6 +3,8 @@
 mod app;
 mod config;
 mod game;
+mod invite;
+mod net;
 mod ops;
 mod remote;
 mod selfupdate;

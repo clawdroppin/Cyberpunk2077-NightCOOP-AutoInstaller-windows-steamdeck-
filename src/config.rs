@@ -110,6 +110,10 @@ pub struct InstallState {
     pub nightcoop_version: Option<String>,
     pub nightcoop_sha256: Option<String>,
     pub nightcoop_dll_sha256: Option<String>,
+    /// Size and modified time of that DLL, so status checks can skip re-hashing it.
+    pub nightcoop_dll_stamp: Option<String>,
+    /// Fingerprint of the saves folder at the last backup (count, size, newest change).
+    pub last_backup_fingerprint: Option<String>,
     pub nightcoop_from_file: Option<String>,
     pub installed_at: Option<String>,
     pub last_save_backup: Option<String>,
