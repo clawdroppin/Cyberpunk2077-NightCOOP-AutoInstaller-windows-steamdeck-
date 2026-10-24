@@ -410,6 +410,14 @@ impl App {
                     ops::apply_launch_option(&game, true, restart_steam, rep)?;
                 }
             }
+            // RED4ext needs Microsoft's VC++ runtime inside the Proton prefix (else: "error 998").
+            if game.uses_proton() {
+                match game.steam.as_ref().and_then(steam::vc_runtime_ok) {
+                    Some(false) => ops::install_vc_runtime(&game, rep)?,
+                    Some(true) => rep.log("Visual C++ runtime is in place."),
+                    None => rep.log("Start Cyberpunk once (until the menu), quit, then press this button again — the Visual C++ runtime goes into the game's Proton files, which appear on first start."),
+                }
+            }
             // Everything is current for this game build now.
             state.game_build_id = game.steam.as_ref().and_then(|g| g.build_id.clone());
             Ok(Extra::Remote(info))
@@ -641,6 +649,11 @@ impl App {
             if s.needs_launch_option() {
                 let ok = s.launch_option_ok();
                 check_row(ui, Some(ok), "Proton DLL override", if ok { "set in Steam launch options" } else { "not set — RED4ext won't load under Proton" });
+                match s.vc_runtime {
+                    Some(true) => check_row(ui, Some(true), "Visual C++ runtime", "installed in the game's Proton prefix"),
+                    Some(false) => check_row(ui, Some(false), "Visual C++ runtime", "missing — RED4ext fails with “error 998”. Press the yellow button to add it."),
+                    None => check_row(ui, None, "Visual C++ runtime", "start Cyberpunk once (until the menu), quit, then press the yellow button"),
+                }
                 if let Some(p) = &s.proton {
                     check_row(ui, Some(true), "Proton", p);
                 }
@@ -1318,12 +1331,21 @@ impl App {
                 if ui.button("📋  Copy diagnostics").clicked() {
                     ui.ctx().copy_text(diag.clone());
                 }
-                if let Some(g) = &self.status.game {
+                if let Some(g) = &self.status.game.clone() {
                     if ui.button("Open game folder").clicked() {
                         util::open_path(&g.dir);
                     }
                     if ui.button("Open logs").clicked() {
                         util::open_path(g.red4ext_dir().join("logs"));
+                    }
+                    if g.uses_proton()
+                        && ui
+                            .add_enabled(!self.busy() && !self.status.game_running, egui::Button::new("Install Visual C++ runtime"))
+                            .on_hover_text("Fixes “RED4ext (error 998)” under Proton")
+                            .clicked()
+                    {
+                        let gc = g.clone();
+                        self.spawn(&ctx, "Installing the Visual C++ runtime", move |rep, _, _| ops::install_vc_runtime(&gc, rep).map(|_| Extra::None));
                     }
                     if g.steam.is_some() && ui.button("Verify game files (Steam)").on_hover_text("Fixes broken game files. Mods stay installed.").clicked() {
                         util::open_path(format!("steam://validate/{}", steam::CYBERPUNK_APPID));
@@ -1343,17 +1365,18 @@ impl App {
         });
         card(ui, |ui| {
             ui.label(RichText::new("COMMON PROBLEMS").color(ACCENT).strong());
-            let items: [(&str, &str); 8] = [
+            let items: &[(&str, &str)] = &[
                 ("No “Co-op” item in the main menu", "RED4ext didn't load the plugin. Check the diagnostics above: RED4ext and NightCoop must be installed, and on Steam Deck/Linux the Proton launch option must be set. The RED4ext log says why a plugin was skipped."),
                 ("Worked before, broke after a game update", "Cyberpunk patches break RED4ext and plugins until they're updated. Press “Check for updates”, then “Update everything”. NightCoop lists the game versions each build supports."),
                 ("Can't join each other", "Open 👥 Play together: paste your partner's versions to check the builds match (same protocol number), and both run the connection check — if only one side fails, that network is the problem (school/work Wi-Fi often blocks UDP)."),
-                ("Game crashes on start (Deck)", "Try Proton Experimental or the latest Proton in Cyberpunk → Properties → Compatibility. As a last resort install vcrun2022 with Protontricks."),
+                ("“RED4ext (error 998)” / “RED4ext could not be loaded” (Deck)", "Proton is missing Microsoft's Visual C++ runtime, which RED4ext needs. Press “Install everything” on Home (or the Visual C++ button above) — the helper installs it into the game's Proton files. Manual way: install Protontricks from Discover, then run in Konsole: flatpak run com.github.Matoking.protontricks 1091500 --force vcrun2022"),
+                ("Game crashes on start (Deck)", "Try Proton Experimental or the latest Proton in Cyberpunk → Properties → Compatibility."),
                 ("Stutter every few seconds", "Use Borderless window instead of exclusive fullscreen, and turn off the Discord overlay / frame generation."),
                 ("“Server failed the key check”", "The server fingerprint doesn't match: a typo or the owner made a new key. Ask them for the current address#fingerprint."),
                 ("Remove the mod for good", "Mods & Versions → 🗑 Remove everything uninstalls NightCoop, RED4ext and the launch option. Saves stay."),
                 ("Want to play without mods", "Home → 🔌 Mods off. Cyberpunk then starts completely unmodded; your mods are kept and the Home page offers “Turn mods back ON” whenever you open the helper again."),
             ];
-            for (q, a) in items {
+            for &(q, a) in items {
                 ui.collapsing(q, |ui| {
                     ui.label(a);
                 });

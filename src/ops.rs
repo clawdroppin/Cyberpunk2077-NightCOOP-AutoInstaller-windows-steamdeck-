@@ -618,6 +618,39 @@ pub fn apply_launch_option(game: &Game, enable: bool, restart_steam: bool, rep: 
     Ok(())
 }
 
+// ---------- Visual C++ runtime (Proton) ----------
+
+/// Installs Microsoft's VC++ 2015-2022 runtime into the game's Proton prefix — the fix for
+/// "RED4ext (error 998) … RED4ext could not be loaded". Same as `protontricks 1091500 vcrun2022`.
+pub fn install_vc_runtime(game: &Game, rep: &Reporter) -> Result<()> {
+    ensure_game_closed()?;
+    let sg = game.steam.as_ref().ok_or_else(|| anyhow!("only needed for the Steam version under Proton"))?;
+    if steam::vc_runtime_ok(sg).is_none() {
+        bail!("Cyberpunk hasn't been started on this device yet. Start it once (until the menu), quit, then try again.");
+    }
+    if steam::vc_dlls_ok(sg) != Some(true) {
+        let exe = config::sub("downloads").join("vc_redist.x64.exe");
+        rep.download(steam::VC_REDIST_URL, &exe, None, "the Microsoft Visual C++ runtime")?;
+        rep.progress(None, "Installing the Visual C++ runtime into the game's Proton prefix (about a minute)…");
+        let code = steam::run_in_prefix(sg, &exe, &["/install", "/quiet", "/norestart"])?;
+        // 0 = done, 3010 = done (reboot "needed"), 1638 = a newer one is already there.
+        if !matches!(code, 0 | 3010 | 1638) {
+            rep.log(format!("The runtime installer ended with code {code}."));
+        }
+    }
+    // Like winetricks: make Wine load Microsoft's DLLs rather than its own stand-ins.
+    rep.progress(None, "Telling Proton to use the Visual C++ runtime…");
+    steam::set_vc_overrides(sg)?;
+    if steam::vc_runtime_ok(sg) != Some(true) {
+        bail!(
+            "the Visual C++ runtime still isn't in place. Install Protontricks from Discover, then run in Konsole: \
+             flatpak run com.github.Matoking.protontricks 1091500 --force vcrun2022"
+        );
+    }
+    rep.log("Visual C++ runtime installed — RED4ext can load now.");
+    Ok(())
+}
+
 // ---------- recognising a build installed by hand ----------
 
 /// NightCoop.dll has no version resource, but it embeds its build id (e.g. `a7c537d`) as text.
@@ -797,6 +830,17 @@ mod tests {
         let m = remote::nightcoop_manifest(remote::NIGHTCOOP_MANIFEST).unwrap();
         println!("nightcoop releases: {}", m.releases.len());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[ignore = "downloads Microsoft's VC++ runtime installer"]
+    fn real_vc_redist_download() {
+        let dest = std::env::temp_dir().join(format!("nchelper-vc-{}.exe", std::process::id()));
+        util::download(steam::VC_REDIST_URL, &dest, None, &mut |_, _| {}).unwrap();
+        let v = util::pe_version(&dest).expect("a Windows installer");
+        println!("vc_redist version {v}");
+        assert!(util::cmp_versions(&v, "14.40").is_ge());
+        let _ = fs::remove_file(&dest);
     }
 
     #[test]

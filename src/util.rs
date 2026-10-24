@@ -256,10 +256,13 @@ pub fn version_covers(entry: &str, game: &str) -> bool {
 
 /// Reads the FileVersion / ProductVersion of a Windows PE file (works on any OS).
 pub fn pe_version(path: &Path) -> Option<String> {
-    use pelite::pe64::{Pe, PeFile};
     let map = pelite::FileMap::open(path).ok()?;
-    let pe = PeFile::from_bytes(&map).ok()?;
-    let info = pe.resources().ok()?.version_info().ok()?;
+    // 64-bit for game files; installers (e.g. vc_redist) are 32-bit even when they install 64-bit code.
+    let resources = match pelite::PeFile::from_bytes(&map).ok()? {
+        pelite::Wrap::T64(pe) => pelite::pe64::Pe::resources(pe).ok()?,
+        pelite::Wrap::T32(pe) => pelite::pe32::Pe::resources(pe).ok()?,
+    };
+    let info = resources.version_info().ok()?;
     if let Some(lang) = info.translation().first() {
         for key in ["ProductVersion", "FileVersion"] {
             if let Some(v) = info.value(*lang, key) {

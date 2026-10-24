@@ -158,6 +158,8 @@ pub struct Status {
     /// The game's Steam build changed since mods were installed.
     pub game_updated: bool,
     pub cloud: Option<steam::CloudInfo>,
+    /// Microsoft's VC++ runtime in the Proton prefix (`None`: no prefix yet / not Proton).
+    pub vc_runtime: Option<bool>,
 }
 
 impl Status {
@@ -208,6 +210,9 @@ impl Status {
         }
         if let Some(sg) = &game.steam {
             s.proton = steam::proton_version(sg);
+            if game.uses_proton() {
+                s.vc_runtime = steam::vc_runtime_ok(sg);
+            }
             s.users = steam::user_configs(&sg.steam_root);
             s.cloud = steam::cloud_info(&sg.steam_root);
             s.steam_build = sg.build_id.clone();
@@ -239,7 +244,7 @@ impl Status {
             && self.loader_present
             && self.red4ext_version.is_some()
             && self.nightcoop_installed
-            && (!self.needs_launch_option() || self.launch_option_ok())
+            && (!self.needs_launch_option() || (self.launch_option_ok() && self.vc_runtime != Some(false)))
     }
 
     pub fn diagnostics(&self, state: &InstallState) -> String {
@@ -265,6 +270,11 @@ impl Status {
         line("Game exe version", opt(&self.game_version));
         line("Phantom Liberty", self.phantom_liberty.to_string());
         line("Proton", opt(&self.proton));
+        line("VC++ runtime (prefix)", match self.vc_runtime {
+            Some(true) => "ok".into(),
+            Some(false) => "MISSING or too old (RED4ext error 998)".into(),
+            None => "-".into(),
+        });
         line("RED4ext loader", self.loader_present.to_string());
         line("RED4ext", opt(&self.red4ext_version));
         line("NightCoop", format!("{} (installed {}, disabled {})", opt(&self.nightcoop_version), self.nightcoop_installed, self.nightcoop_disabled));

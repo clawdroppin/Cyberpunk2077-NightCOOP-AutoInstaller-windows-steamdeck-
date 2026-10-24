@@ -176,6 +176,118 @@ pub fn proton_version(game: &SteamGame) -> Option<String> {
     (!v.is_empty()).then(|| v.to_string())
 }
 
+// ---------- Visual C++ runtime inside the Proton prefix ----------
+
+/// RED4ext (and its loader) link against Microsoft's VC++ 2015-2022 runtime. Wine's built-in
+/// stand-ins are too old for current builds: loading RED4ext.dll then fails with error 998.
+pub const VC_REDIST_URL: &str = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
+const VC_MIN_VERSION: &str = "14.40";
+const VC_DLLS: [&str; 3] = ["msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"];
+
+/// DLLs Wine must load from Microsoft's runtime instead of its own stand-ins — the same list
+/// `winetricks vcrun2022` marks "native,builtin".
+const VC_OVERRIDES: [&str; 11] = [
+    "concrt140", "msvcp140", "msvcp140_1", "msvcp140_2", "msvcp140_atomic_wait", "msvcp140_codecvt_ids",
+    "vcamp140", "vccorlib140", "vcomp140", "vcruntime140", "vcruntime140_1",
+];
+
+/// `Some(true)` when the prefix has Microsoft's runtime ≥ 14.40 and Wine is told to use it,
+/// `Some(false)` when it doesn't, `None` when the prefix doesn't exist yet (game never started).
+pub fn vc_runtime_ok(game: &SteamGame) -> Option<bool> {
+    let dlls = vc_dlls_ok(game)?;
+    Some(dlls && vc_overrides_set(game))
+}
+
+/// Microsoft's runtime DLLs (not Wine's stand-ins, ≥ 14.40) are in the prefix's system32.
+pub fn vc_dlls_ok(game: &SteamGame) -> Option<bool> {
+    let sys32 = game.compatdata().join("pfx").join("drive_c").join("windows").join("system32");
+    if !sys32.is_dir() {
+        return None;
+    }
+    Some(VC_DLLS.iter().all(|name| {
+        let path = sys32.join(name);
+        let mut head = vec![0u8; 512];
+        let is_wine = fs::File::open(&path)
+            .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+            .map(|n| head[..n].windows(12).any(|w| w == b"Wine builtin" || w == b"Wine placeho"))
+            .unwrap_or(true);
+        !is_wine && crate::util::pe_version(&path).map(|v| crate::util::cmp_versions(&v, VC_MIN_VERSION).is_ge()).unwrap_or(false)
+    }))
+}
+
+/// The prefix's registry (`pfx/user.reg`) tells Wine to prefer the native runtime DLLs.
+pub fn vc_overrides_set(game: &SteamGame) -> bool {
+    let Ok(reg) = fs::read_to_string(game.compatdata().join("pfx").join("user.reg")) else { return false };
+    let Some(start) = reg.find("[Software\\\\Wine\\\\DllOverrides]") else { return false };
+    let section = &reg[start..];
+    let section = &section[..section[1..].find("\n[").map(|i| i + 1).unwrap_or(section.len())];
+    ["msvcp140", "vcruntime140", "vcruntime140_1"].iter().all(|d| section.contains(&format!("\"{d}\"=\"native")))
+}
+
+/// Marks the runtime DLLs "native,builtin" in the prefix's registry (one silent `regedit` run).
+pub fn set_vc_overrides(game: &SteamGame) -> Result<()> {
+    let mut reg = String::from("Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\Wine\\DllOverrides]\r\n");
+    for d in VC_OVERRIDES {
+        reg.push_str(&format!("\"{d}\"=\"native,builtin\"\r\n"));
+    }
+    let file = crate::config::sub("downloads").join("nightcoop-vc-overrides.reg");
+    fs::write(&file, reg)?;
+    // Wine maps the Linux root to drive Z:.
+    let wine_path = format!("Z:{}", file.display().to_string().replace('/', "\\"));
+    let code = run_in_prefix(game, "regedit", &["/S", &wine_path])?;
+    if code != 0 {
+        bail!("regedit ended with code {code}");
+    }
+    Ok(())
+}
+
+/// The Proton build the game runs with: `compatdata/1091500/config_info` lists paths inside it.
+/// Falls back to the newest Proton installed in any Steam library.
+pub fn proton_dir(game: &SteamGame) -> Option<PathBuf> {
+    if let Ok(text) = fs::read_to_string(game.compatdata().join("config_info")) {
+        for line in text.lines().skip(1) {
+            if let Some(dir) = Path::new(line.trim()).ancestors().find(|a| a.join("proton").is_file()) {
+                return Some(dir.to_path_buf());
+            }
+        }
+    }
+    let mut found: Vec<PathBuf> = library_folders(&game.steam_root)
+        .into_iter()
+        .flat_map(|lib| fs::read_dir(lib.join("steamapps").join("common")).into_iter().flatten().flatten().map(|e| e.path()))
+        .filter(|p| p.join("proton").is_file() && p.file_name().map(|n| n.to_string_lossy().starts_with("Proton")).unwrap_or(false))
+        .collect();
+    // "Proton - Experimental" first, then the highest numbered version.
+    found.sort_by(|a, b| {
+        let key = |p: &PathBuf| {
+            let n = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            (n.contains("Experimental"), n)
+        };
+        let (ea, na) = key(a);
+        let (eb, nb) = key(b);
+        eb.cmp(&ea).then_with(|| crate::util::cmp_versions(&nb, &na))
+    });
+    found.into_iter().next()
+}
+
+/// Runs a Windows program inside the game's Proton prefix (what Protontricks does) and waits for it.
+pub fn run_in_prefix(game: &SteamGame, exe: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Result<i32> {
+    let proton = proton_dir(game).ok_or_else(|| anyhow!("couldn't find the Proton version Cyberpunk uses — start the game once, then try again"))?;
+    let status = Command::new(proton.join("proton"))
+        .arg("run")
+        .arg(exe.as_ref())
+        .args(args)
+        .env("STEAM_COMPAT_DATA_PATH", game.compatdata())
+        .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &game.steam_root)
+        .env("SteamAppId", CYBERPUNK_APPID)
+        .env("SteamGameId", CYBERPUNK_APPID)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("could not start Proton ({})", proton.display()))?;
+    Ok(status.code().unwrap_or(-1))
+}
+
 // ---------- Steam Cloud ----------
 
 #[derive(Debug, Clone)]
@@ -419,6 +531,47 @@ pub fn launch_game() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vc_runtime_detection() {
+        let root = std::env::temp_dir().join(format!("nchelper-vc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let game = SteamGame { steam_root: root.clone(), library: root.clone(), game_dir: root.join("game"), build_id: None };
+        assert_eq!(vc_runtime_ok(&game), None, "no prefix yet");
+        let sys32 = game.compatdata().join("pfx/drive_c/windows/system32");
+        fs::create_dir_all(&sys32).unwrap();
+        // Wine's stand-ins carry this marker in their DOS stub.
+        let mut wine = vec![0u8; 0x40];
+        wine.extend_from_slice(b"Wine builtin DLL\0");
+        for n in VC_DLLS {
+            fs::write(sys32.join(n), &wine).unwrap();
+        }
+        assert_eq!(vc_runtime_ok(&game), Some(false));
+        // Microsoft's own runtime (copied from this Windows machine when available).
+        let real = std::path::Path::new("C:/Windows/System32");
+        if VC_DLLS.iter().all(|n| real.join(n).is_file()) {
+            for n in VC_DLLS {
+                fs::copy(real.join(n), sys32.join(n)).unwrap();
+            }
+            assert_eq!(vc_dlls_ok(&game), Some(true));
+            assert_eq!(vc_runtime_ok(&game), Some(false), "overrides not set yet");
+            fs::write(
+                game.compatdata().join("pfx/user.reg"),
+                "WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\DllOverrides] 1700000000\n#time=1\n\"msvcp140\"=\"native,builtin\"\n\"vcruntime140\"=\"native,builtin\"\n\"vcruntime140_1\"=\"native,builtin\"\n\n[Software\\\\Wine\\\\Other] 1\n",
+            )
+            .unwrap();
+            assert_eq!(vc_runtime_ok(&game), Some(true));
+        }
+        // The Proton build comes from config_info's paths (a folder holding the `proton` script).
+        let proton = root.join("lib/steamapps/common/Proton 9.0 (Beta)");
+        fs::create_dir_all(proton.join("files/share/fonts")).unwrap();
+        fs::write(proton.join("proton"), b"#!/usr/bin/env python3").unwrap();
+        fs::write(game.compatdata().join("config_info"), format!("9.0-302
+{}/files/share/fonts/
+", proton.display())).unwrap();
+        assert_eq!(proton_dir(&game).as_deref(), Some(proton.as_path()));
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn launch_option_merging() {

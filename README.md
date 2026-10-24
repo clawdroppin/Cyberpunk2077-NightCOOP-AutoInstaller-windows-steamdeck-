@@ -34,7 +34,7 @@ Getting a RED4ext mod running on the Steam Deck normally means Desktop Mode, dig
 | 💾 | **Backs up your saves** | Zips your saves first (on the Deck it finds them inside the Proton prefix). |
 | 🌃 | **Installs NightCoop** | Latest build from the official release list on nightcoop.net, checksum-verified. |
 | 🧩 | **Sets up RED4ext** | Uses the RED4ext that ships inside the NightCoop build (the pair its authors tested). GitHub is only a fallback. |
-| 🐧 | **Fixes Proton** *(Deck/Linux)* | Adds `WINEDLLOVERRIDES="winmm,version=n,b" %command%` to Steam's launch options, keeping anything you already had. |
+| 🐧 | **Fixes Proton** *(Deck/Linux)* | Adds `WINEDLLOVERRIDES="winmm,version=n,b" %command%` to Steam's launch options (keeping anything you already had) and installs Microsoft's **Visual C++ runtime** into the game's Proton files — without it RED4ext fails with "error 998". |
 | ✅ | **Checks it all** | Green ticks when everything is ready to play. |
 
 Press the same button again whenever an update is out — it only replaces what changed.
@@ -127,6 +127,14 @@ RED4ext didn't load the plugin. Open **🔧 Troubleshoot** — the diagnostics s
 <summary><b>It worked yesterday, broke after a Cyberpunk update</b></summary>
 
 Game patches break RED4ext and its plugins until they're updated. Press **⟳ Check for updates**, then **⬆ Update everything**. Each NightCoop build lists the game versions it supports on **📦 Mods & Versions**.
+</details>
+
+<details>
+<summary><b>"RED4ext (error 998)" — "RED4ext could not be loaded" (Steam Deck / Linux)</b></summary>
+
+RED4ext needs Microsoft's Visual C++ 2015–2022 runtime, and Proton only ships a stand-in that's too old for it. Start the game once (until the menu), quit, then press **Install everything** in the helper — it installs the runtime into the game's Proton files (needs v0.4.1+). The Home page shows a **Visual C++ runtime** row.
+
+Manual way: install **Protontricks** from Discover, then in Konsole run `flatpak run com.github.Matoking.protontricks 1091500 --force vcrun2022`.
 </details>
 
 <details>

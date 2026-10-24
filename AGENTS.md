@@ -54,6 +54,14 @@ one-button flow working without a terminal.
 - **RED4ext** zip layout: `bin/x64/winmm.dll` + `red4ext/RED4ext.dll` (+ licenses). GitHub assets carry a
   `digest: "sha256:…"` which we verify. Symbols zip is skipped.
 - **Proton** needs `WINEDLLOVERRIDES="winmm,version=n,b" %command%` (`version` is harmless; it helps CET users).
+- **Proton also needs Microsoft's VC++ 2015-2022 runtime ≥ 14.40 in the prefix** — `RED4ext.dll` and its `winmm.dll` import
+  `msvcp140`/`vcruntime140`/`vcruntime140_1`. With only Wine's stand-ins the loader shows **"RED4ext (error 998) … RED4ext could
+  not be loaded"** (ERROR_NOACCESS; first seen on the user's Deck, matches RED4ext issues #76/#115). `ops::install_vc_runtime`
+  downloads `https://aka.ms/vs/17/release/vc_redist.x64.exe` (a 32-bit PE), runs it with `<proton>/proton run … /install /quiet
+  /norestart` (env `STEAM_COMPAT_DATA_PATH`, `STEAM_COMPAT_CLIENT_INSTALL_PATH`), then sets the winetricks `vcrun2022` DLL
+  overrides (native,builtin) via `regedit /S`. `steam::vc_runtime_ok` checks system32 DLLs (no "Wine builtin" marker, version)
+  plus the overrides in `pfx/user.reg`. The prefix only exists after the game's first start. The Proton build is read from
+  `compatdata/1091500/config_info`.
 - **Deck save path**: `<library>/steamapps/compatdata/1091500/pfx/drive_c/users/steamuser/Saved Games/CD Projekt Red/Cyberpunk 2077`.
 - **Mods off** moves `bin/x64/winmm.dll` and the whole `red4ext/` folder into `<game>/_NightCoopHelper_mods_off/`
   (same drive, so it's a rename). `Status.mods_off` is "that folder exists"; every install/uninstall calls
@@ -129,7 +137,8 @@ print([t.needed for s in f.iter_sections() if s.name == ".dynamic" for t in s.it
 
 ## Open items
 
-- [ ] On the Deck: full "Install everything" from Desktop Mode, Steam restart, launch option written, game shows the Co-op menu.
+- [x] On the Deck: "Install everything" from Desktop Mode wrote the launch option; the loader ran (winmm.dll loaded under Proton).
+- [ ] On the Deck: the VC++ runtime install via `proton run` works outside Steam's container, and the Co-op menu appears.
 - [ ] "Add to Steam" shortcut appears in Gaming Mode and launches.
 - [ ] File picker (xdg-desktop-portal) works in Desktop Mode.
 - [ ] NightCoop officially supports Windows 10/11 only; collect Deck/Proton reports.
@@ -137,6 +146,10 @@ print([t.needed for s in f.iter_sections() if s.name == ".dynamic" for t in s.it
   controller-friendly focus navigation for Gaming Mode, identify manually installed builds by hashing the DLL inside cached zips.
 
 ## Changelog
+
+- **0.4.1** — Fix for "RED4ext (error 998) / RED4ext could not be loaded" on the Steam Deck: the helper detects and installs
+  Microsoft's Visual C++ runtime into the game's Proton prefix (plus winetricks-style DLL overrides) during "Install everything",
+  with a Home status row, a Troubleshoot button and a help entry. `util::pe_version` now reads 32-bit PE files too.
 
 - **0.4.0** — New **Play together** page: paste a partner's versions/invite/message → match verdict, one-click switch to their
   build, decoded invite with Copy; "message for my partner"; STUN connection check; Deck paste (Ctrl+V back-button) tip;
