@@ -105,6 +105,16 @@ fn stun_query(sock: &UdpSocket, server: &str, seed: u8) -> Option<SocketAddr> {
     None
 }
 
+/// This network's public IPv4 address as the internet sees it (asked from a STUN server).
+pub fn public_ip() -> Option<std::net::Ipv4Addr> {
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.set_read_timeout(Some(Duration::from_millis(900))).ok()?;
+    STUN_SERVERS.iter().enumerate().find_map(|(i, srv)| stun_query(&sock, srv, i as u8)).and_then(|a| match a.ip() {
+        std::net::IpAddr::V4(ip) => Some(ip),
+        _ => None,
+    })
+}
+
 /// Runs the check (a few seconds at most). Sends only standard STUN requests.
 pub fn connection_check() -> CheckResult {
     let hub_resolves = (OFFICIAL_HUB, 47800).to_socket_addrs().map(|mut a| a.next().is_some()).unwrap_or(false);

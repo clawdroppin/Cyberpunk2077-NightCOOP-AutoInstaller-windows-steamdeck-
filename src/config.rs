@@ -115,6 +115,9 @@ pub struct InstallState {
     /// Fingerprint of the saves folder at the last backup (count, size, newest change).
     pub last_backup_fingerprint: Option<String>,
     pub nightcoop_from_file: Option<String>,
+    /// Files a NightCoop build shipped outside its plugin folder and RED4ext's own files
+    /// (other plugins, archive/r6 mods, extra loader files), relative to the game folder.
+    pub nightcoop_extra_files: Vec<String>,
     pub installed_at: Option<String>,
     pub last_save_backup: Option<String>,
     /// Steam build of the game when mods were last installed, to spot game updates.

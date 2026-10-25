@@ -3,9 +3,11 @@
 mod app;
 mod config;
 mod game;
+mod hub;
 mod invite;
 mod net;
 mod ops;
+mod upnp;
 mod remote;
 mod selfupdate;
 mod shortcuts;
@@ -17,6 +19,8 @@ use eframe::egui;
 
 fn main() -> eframe::Result {
     selfupdate::cleanup();
+    // Leftovers of installs that were interrupted (power off, crash).
+    let _ = std::fs::remove_dir_all(config::data_dir().join("staging"));
     let deck = steam::is_steam_deck();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("NightCoop Helper")

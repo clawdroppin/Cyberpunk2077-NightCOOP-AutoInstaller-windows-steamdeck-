@@ -58,6 +58,14 @@ pub fn github_releases(repo: &str) -> Result<Vec<GhRelease>> {
     Ok(list)
 }
 
+/// The newest release tag without GitHub's rate-limited API: `/releases/latest` redirects to `/releases/tag/<tag>`.
+pub fn latest_tag_via_redirect(repo: &str) -> Result<String> {
+    use ureq::ResponseExt;
+    let resp = util::agent().get(&format!("https://github.com/{repo}/releases/latest")).call()?;
+    let path = resp.get_uri().path().to_string();
+    path.rsplit_once("/tag/").map(|(_, t)| t.to_string()).filter(|t| !t.is_empty()).ok_or_else(|| anyhow::anyhow!("no releases found for {repo}"))
+}
+
 /// The main RED4ext zip of a release (not the debug symbols).
 pub fn red4ext_asset(rel: &GhRelease) -> Option<&GhAsset> {
     rel.assets.iter().find(|a| {
@@ -77,6 +85,9 @@ pub struct NcManifest {
     pub releases: Vec<NcRelease>,
     pub demo: Option<bool>,
 }
+
+/// The newest release-list format this helper was written for.
+pub const KNOWN_SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -188,6 +199,11 @@ fn absolute(base: &str, url: &str) -> String {
 }
 
 impl NcManifest {
+    /// The site moved to a newer list format: parsing stays lenient, but the helper should be updated.
+    pub fn newer_format(&self) -> bool {
+        self.schema.map(|s| s > KNOWN_SCHEMA).unwrap_or(false)
+    }
+
     /// The newest non-withdrawn release for the chosen channel.
     pub fn latest_for(&self, channel: Channel) -> Option<&NcRelease> {
         let usable = |r: &&NcRelease| !r.is_yanked() && r.mod_file().is_some();

@@ -5,7 +5,7 @@ use crate::game::{self, Status};
 use crate::ops::{self, Event, Reporter};
 use crate::remote::{self, GhRelease, NcManifest};
 use crate::selfupdate::{self, HelperUpdate};
-use crate::{invite, net, shortcuts, steam, util};
+use crate::{hub, invite, net, shortcuts, steam, upnp, util};
 use anyhow::{anyhow, Result};
 use eframe::egui::{self, Color32, RichText};
 use std::path::PathBuf;
@@ -26,19 +26,21 @@ enum Page {
     Versions,
     Saves,
     Together,
+    Server,
     Troubleshoot,
     Guide,
     Settings,
 }
 
 impl Page {
-    const ALL: [Page; 7] = [Page::Home, Page::Together, Page::Versions, Page::Saves, Page::Troubleshoot, Page::Guide, Page::Settings];
+    const ALL: [Page; 8] = [Page::Home, Page::Together, Page::Versions, Page::Saves, Page::Server, Page::Troubleshoot, Page::Guide, Page::Settings];
     fn label(self) -> &'static str {
         match self {
             Page::Home => "🏠  Home",
             Page::Versions => "📦  Mods & Versions",
             Page::Saves => "💾  Saves",
             Page::Together => "👥  Play together",
+            Page::Server => "🖥  Host a server",
             Page::Troubleshoot => "🔧  Troubleshoot",
             Page::Guide => "🎮  Deck Guide",
             Page::Settings => "⚙  Settings",
@@ -60,6 +62,9 @@ enum Extra {
     OpenFolderOf(PathBuf),
     HelperUpdated,
     Connection(net::CheckResult),
+    Router(RouterCheck),
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Wsl(WslStatus),
 }
 
 struct JobDone {
@@ -110,6 +115,7 @@ pub struct App {
     /// The invite the host pasted, to send along with their versions.
     my_invite: String,
     connection: Option<net::CheckResult>,
+    server: ServerUi,
     /// Sizes of backups / rollbacks / download cache, computed when Settings is first shown.
     data_sizes: Option<(u64, u64, u64)>,
     /// Any Steam install found (cached; looking it up hits the disk).
@@ -144,6 +150,7 @@ impl App {
             partner_text: String::new(),
             my_invite: String::new(),
             connection: None,
+            server: ServerUi { vps_user: "root".into(), ..Default::default() },
             data_sizes: None,
             steam_found: !steam::steam_roots().is_empty(),
         };
@@ -223,9 +230,18 @@ impl App {
                             }
                             Extra::HelperUpdated => self.helper_restart_ready = true,
                             Extra::Connection(r) => self.connection = Some(r),
+                            Extra::Router(r) => self.server.router = Some(r),
+                            Extra::Wsl(w) => {
+                                if let (Some(fp), Some(ip)) = (&w.fingerprint, &w.public_ip) {
+                                    if hub::parse_address(&self.server.address).is_none() {
+                                        self.server.address = format!("{ip}#{fp}");
+                                    }
+                                }
+                                self.server.wsl = Some(w);
+                            }
                             Extra::None => {}
                         }
-                        if job.title != "Checking for updates" && job.title != "Checking the connection" {
+                        if !["Checking for updates", "Checking the connection", "Checking your network", "Checking the server setup"].contains(&job.title.as_str()) {
                             self.banner = Some((true, format!("{} — done.", job.title)));
                         }
                     }
@@ -402,20 +418,25 @@ impl App {
                 }
             }
 
-            // Proton launch option
-            if needs_lo {
-                if steam::steam_running() && !restart_steam {
-                    rep.log("Skipped the Steam launch option (Steam is running). Set it on the Mods & Versions page, or paste it yourself.");
-                } else {
-                    ops::apply_launch_option(&game, true, restart_steam, rep)?;
-                }
-            }
             // RED4ext needs Microsoft's VC++ runtime inside the Proton prefix (else: "error 998").
+            // Done before the launch option: that step may stop at Steam, and this one doesn't need it.
             if game.uses_proton() {
                 match game.steam.as_ref().and_then(steam::vc_runtime_ok) {
                     Some(false) => ops::install_vc_runtime(&game, rep)?,
                     Some(true) => rep.log("Visual C++ runtime is in place."),
                     None => rep.log("Start Cyberpunk once (until the menu), quit, then press this button again — the Visual C++ runtime goes into the game's Proton files, which appear on first start."),
+                }
+            }
+            // Proton launch option
+            if needs_lo {
+                if steam::steam_running() && (!restart_steam || steam::in_gaming_mode()) {
+                    rep.log(if steam::in_gaming_mode() {
+                        "Skipped the Steam launch option: Steam can't be restarted in Gaming Mode. Switch to Desktop Mode and press this button again, or paste it in Cyberpunk → Properties → Launch Options."
+                    } else {
+                        "Skipped the Steam launch option (Steam is running). Set it on the Mods & Versions page, or paste it yourself."
+                    });
+                } else {
+                    ops::apply_launch_option(&game, true, restart_steam, rep)?;
                 }
             }
             // Everything is current for this game build now.
@@ -452,7 +473,8 @@ impl App {
 
     fn request_setup(&mut self, ctx: &egui::Context) {
         let needs_lo = self.status.needs_launch_option() && !self.status.launch_option_ok();
-        if needs_lo && steam::steam_running() {
+        // Never offer to restart Steam in Gaming Mode: that would end the Deck's session.
+        if needs_lo && steam::steam_running() && !steam::in_gaming_mode() {
             self.confirm = Some(Confirm::Setup);
         } else {
             self.start_setup(ctx, false);
@@ -569,6 +591,9 @@ impl App {
                     }
                 });
             });
+        }
+        if matches!(&self.remote.nightcoop, Some(Ok(m)) if m.newer_format()) {
+            warn_card(ui, "NightCoop changed the format of its release list. If installing or updating misbehaves, update this helper (Settings → Helper updates → Check now).");
         }
         if let Some(Ok(Some(u))) = self.remote.helper.clone() {
             let v = u.version.clone();
@@ -708,7 +733,7 @@ impl App {
                     .clicked()
             {
                 if let Some(g) = self.status.game.clone() {
-                    self.spawn(&ctx, "Turning mods off", move |rep, _, _| ops::mods_off(&g, rep).map(|_| Extra::None));
+                    self.spawn(&ctx, "Turning mods off", move |rep, state, _| ops::mods_off(&g, &state.nightcoop_extra_files.clone(), rep).map(|_| Extra::None));
                 }
             }
         });
@@ -1276,8 +1301,8 @@ impl App {
                  with an address and key fingerprint, like hub.example.org#K3QF-9X2M-TV7A-0D4R. Your list lives in servers.txt next to NightCoop.dll.",
             )
             .color(DIM));
-            if ui.link("Run your own server (official guide)").clicked() {
-                util::open_path("https://github.com/Twenfys/nightcoop-hub");
+            if ui.link("Run your own server → 🖥 Host a server").clicked() {
+                self.page = Page::Server;
             }
             let Some(game) = game else { return };
             if !self.status.nightcoop_installed {
@@ -1314,6 +1339,345 @@ impl App {
                     ui.ctx().copy_text(self.servers_text.clone().unwrap_or_default());
                 }
             });
+        });
+    }
+
+    fn server_page(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.heading(RichText::new("Host your own server").size(28.0).strong());
+        ui.label(RichText::new(
+            "NightCoop players meet through a hub: a small server that hands out session codes, helps two players connect \
+             directly, and relays the game when no direct path opens. The official hubs work for most people — your own is for when \
+             they're far away or unreliable for you, or you just want your own.",
+        )
+        .color(DIM));
+        info_card(ui, "Do you two play from the same home? Then you don't need this: on the same Wi-Fi your game traffic already goes directly between your devices.");
+
+        // ----- choose where -----
+        card(ui, |ui| {
+            ui.label(RichText::new("WHERE SHOULD THE SERVER RUN?").color(ACCENT).strong());
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut self.server.place, HostPlace::ThisPc, if cfg!(windows) { "This Windows PC (WSL2)" } else { "This PC" });
+                ui.selectable_value(&mut self.server.place, HostPlace::Vps, "A cheap Linux VPS (~$5/month)");
+                ui.selectable_value(&mut self.server.place, HostPlace::LinuxPc, "Another Linux computer");
+            });
+            let hint = match self.server.place {
+                HostPlace::ThisPc => "Free, but this PC must be on while you play, and your router has to let players in.",
+                HostPlace::Vps => "Most reliable: always on, its own public address, no router setup at home. Recommended for groups.",
+                HostPlace::LinuxPc => "A spare Linux machine at home (Ubuntu 24.04 / Debian 13). Same router setup as hosting on this PC.",
+            };
+            ui.label(RichText::new(hint).color(DIM));
+        });
+
+        match self.server.place {
+            HostPlace::ThisPc => self.server_this_pc(ui, &ctx),
+            HostPlace::Vps => self.server_vps(ui),
+            HostPlace::LinuxPc => self.server_linux_pc(ui, &ctx),
+        }
+
+        // ----- use the server -----
+        card(ui, |ui| {
+            ui.label(RichText::new("USE YOUR SERVER").color(ACCENT).strong());
+            ui.label("Your server's address with its key fingerprint (the setup prints it as NIGHTCOOP_HUB_ADDRESS=…):");
+            ui.add(egui::TextEdit::singleline(&mut self.server.address).desired_width(f32::INFINITY).hint_text("203.0.113.7#K3QF-9X2M-TV7A-0D4R"));
+            match hub::parse_address(&self.server.address) {
+                Some(addr) => {
+                    ui.label(RichText::new(format!("✔ {addr}")).color(OK));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled(self.status.nightcoop_installed, egui::Button::new("🎮  Use this server in my game")).on_hover_text("NightCoop picks it up the next time the game starts").clicked() {
+                            self.banner = Some(match self.status.game.as_ref().map(|g| hub::use_in_game(g, &addr)) {
+                                Some(Ok(())) => (true, "Done — start the game: your server is selected (Co-op → Server: … shows it).".into()),
+                                Some(Err(e)) => (false, format!("{e:#}")),
+                                None => (false, "Game not found.".into()),
+                            });
+                        }
+                        if ui.button("📋  Copy address").clicked() {
+                            ui.ctx().copy_text(addr.clone());
+                        }
+                    });
+                    ui.label(RichText::new(
+                        "Only the host needs this. Host a session and send the invite as usual — it carries the server, so your partner \
+                         just pastes it into Join by code. In the game you can also add it by hand: Co-op → Server: … → Add an own server.",
+                    )
+                    .color(DIM)
+                    .small());
+                }
+                None if !self.server.address.trim().is_empty() => {
+                    ui.label(RichText::new("That doesn't look like address#FINGERPRINT yet.").color(WARN));
+                }
+                None => {}
+            }
+        });
+        if ui.link("The official hub guide (all the details)").clicked() {
+            util::open_path(hub::OFFICIAL_GUIDE);
+        }
+    }
+
+    /// Router check shared by "this PC" and "a Linux PC at home".
+    fn router_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        card(ui, |ui| {
+            ui.label(RichText::new("YOUR ROUTER").color(ACCENT).strong());
+            ui.label(format!(
+                "Players reach a home server through your router: these ports must be forwarded to the computer running it — {}.",
+                hub::ports_text(hub::HOME_THREADS)
+            ));
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(!self.busy(), egui::Button::new("🔎  Check my network")).clicked() {
+                    self.spawn(ctx, "Checking your network", |rep, _, _| {
+                        rep.progress(None, "Asking your router…");
+                        Ok(Extra::Router(router_check(None)))
+                    });
+                }
+                if ui.add_enabled(!self.busy(), egui::Button::new("🔓  Open the ports automatically (UPnP)")).on_hover_text("Asks your router to forward the ports to this computer").clicked() {
+                    self.spawn(ctx, "Opening ports on your router", |rep, _, _| {
+                        rep.progress(None, "Asking your router to forward the ports…");
+                        let r = router_check(Some(true));
+                        if r.ports_opened {
+                            rep.log("The router now forwards the hub's ports to this computer.");
+                        } else {
+                            rep.log("The router didn't accept the forwarding (UPnP may be off). Forward the ports by hand — see the steps below.");
+                        }
+                        Ok(Extra::Router(r))
+                    });
+                }
+                if ui.add_enabled(!self.busy(), egui::Button::new("Close them")).clicked() {
+                    self.spawn(ctx, "Closing ports on your router", |_, _, _| Ok(Extra::Router(router_check(Some(false)))));
+                }
+            });
+            if let Some(r) = self.server.router.clone() {
+                match &r.router {
+                    Ok((name, local, ext)) => {
+                        check_row(ui, Some(true), "Router found", &format!("{name} · this computer is {local}"));
+                        if r.cgnat() {
+                            check_row(
+                                ui,
+                                Some(false),
+                                "Public address",
+                                &format!(
+                                    "your router's address ({}) isn't the one the internet sees — your provider shares one address between customers (CGNAT). \
+                                     Nobody outside can reach a server at home: use a VPS instead, or ask your provider for a public IPv4 address.",
+                                    ext.map(|e| e.to_string()).unwrap_or_else(|| "?".into())
+                                ),
+                            );
+                        } else {
+                            check_row(ui, Some(true), "Public address", &format!("{} — hosting from home can work", r.public_ip.or(*ext).map(|e| e.to_string()).unwrap_or_else(|| "?".into())));
+                        }
+                        if r.ports_opened {
+                            check_row(ui, Some(true), "Ports", "forwarded to this computer by UPnP");
+                        }
+                    }
+                    Err(e) => {
+                        check_row(ui, None, "Router", &format!("{e} — forward the ports by hand (below)."));
+                        if let Some(ip) = r.public_ip {
+                            check_row(ui, Some(true), "Public address", &ip.to_string());
+                        }
+                    }
+                }
+            }
+            ui.collapsing("Forwarding the ports by hand", |ui| {
+                ui.label("1. Open your router's page (often http://192.168.1.1 or http://192.168.0.1, or the router's phone app — eero, Google, Deco…).");
+                ui.label("2. Find “Port forwarding” (sometimes under Advanced, NAT or Firewall).");
+                ui.label(format!("3. Add a rule for {} to this computer's local address (shown above after “Check my network”).", hub::ports_text(hub::HOME_THREADS)));
+                ui.label("4. Give this computer a fixed local address (“DHCP reservation”) so the rule keeps pointing at it.");
+                ui.label("5. If your public address changes now and then, a free dynamic-DNS name (DuckDNS, No-IP…) can stand in for it in your server address.");
+            });
+        });
+    }
+
+    fn server_this_pc(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if steam::is_steam_deck() {
+            warn_card(ui, "The Steam Deck isn't a good server (SteamOS resets system changes and the Deck sleeps). Use a VPS, or a Windows / Linux PC.");
+            return;
+        }
+        if !cfg!(windows) {
+            self.server_linux_pc(ui, ctx);
+            return;
+        }
+        self.router_card(ui, ctx);
+        let w = self.server.wsl.clone();
+        let busy = self.busy();
+        let mut action: Option<&'static str> = None;
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("SET UP THE SERVER ON THIS PC").color(ACCENT).strong());
+                if ui.add_enabled(!busy, egui::Button::new("↻  Check")).clicked() {
+                    action = Some("check");
+                }
+            });
+            ui.label(RichText::new(
+                "The official hub runs on Linux, so it runs inside WSL2 — the Linux that's built into Windows. Each step below is one button; \
+                 the two marked (admin) show one Windows permission prompt.",
+            )
+            .color(DIM));
+            let Some(w) = w else {
+                ui.label(RichText::new("Press ↻ Check to see what's already set up.").color(DIM));
+                return;
+            };
+            if step_row(ui, 1, Some(w.installed && w.distro), "Install WSL with Ubuntu 24.04 (admin)", if w.installed && !w.distro {
+                "WSL is installed. If Ubuntu doesn't show up, restart Windows, or press “Open Ubuntu once” and answer its first-start questions (any user name and password)."
+            } else {
+                "Takes a few minutes and may ask you to restart Windows. Then press ↻ Check."
+            }, Some("Install"), !busy)
+            {
+                action = Some("install");
+            }
+            if w.installed && !w.distro && ui.add_enabled(!busy, egui::Button::new("Open Ubuntu once")).clicked() {
+                action = Some("first_start");
+            }
+            if step_row(ui, 2, Some(w.mirrored), "Share Windows' network with Linux (mirrored mode)", "So players can reach the hub through this PC's address. Restarts WSL once. Needs Windows 11 22H2 or newer.", Some("Set up"), !busy) {
+                action = Some("mirrored");
+            }
+            if step_row(ui, 3, Some(w.firewall), "Let the hub through the firewall (admin)", &format!("Opens {} in Windows Firewall and WSL's own firewall.", hub::ports_text(hub::HOME_THREADS)), Some("Open ports"), !busy) {
+                action = Some("firewall");
+            }
+            if step_row(ui, 4, Some(w.built), "Build the official hub", "Downloads the hub's source from the NightCoop project and builds it inside Ubuntu (a few minutes). Press again later to update it.", Some(if w.built { "Rebuild / update" } else { "Build" }), !busy && w.distro) {
+                action = Some("build");
+            }
+            if step_row(ui, 5, Some(w.running), "Run the server", if w.running {
+                "Running. It keeps running after you close the helper, until you press Stop or Windows shuts down."
+            } else {
+                "Start it before you host a session. It stops when Windows shuts down — start it again next time."
+            }, Some(if w.running { "Stop" } else { "Start" }), !busy && w.built)
+            {
+                action = Some(if w.running { "stop" } else { "start" });
+            }
+            if let Some(fp) = &w.fingerprint {
+                ui.label(RichText::new(format!("Your server's key fingerprint: {fp}")).color(CYAN));
+                ui.label(RichText::new("The key is backed up in the helper's data folder, so the fingerprint stays the same after a reinstall.").color(DIM).small());
+            }
+            let log = config::sub("logs").join("hub.log");
+            if w.built && log.is_file() {
+                ui.collapsing("Server log", |ui| {
+                    for l in hub::log_tail(&log, 12) {
+                        ui.label(RichText::new(l).monospace().size(11.0));
+                    }
+                });
+            }
+        });
+        if let Some(a) = action {
+            self.server_action(ctx, a);
+        }
+    }
+
+    #[cfg(windows)]
+    fn server_action(&mut self, ctx: &egui::Context, action: &'static str) {
+        use hub::wsl;
+        let name = computer_name();
+        let title = match action {
+            "install" => "Installing WSL and Ubuntu",
+            "mirrored" => "Setting up WSL networking",
+            "firewall" => "Opening the firewall",
+            "build" => "Building the hub",
+            "start" => "Starting the server",
+            "stop" => "Stopping the server",
+            "first_start" => {
+                if let Err(e) = wsl::open_first_start() {
+                    self.banner = Some((false, format!("{e:#}")));
+                }
+                return;
+            }
+            _ => "Checking the server setup",
+        };
+        self.spawn(ctx, title, move |rep, _, _| {
+            match action {
+                "install" => {
+                    rep.progress(None, "Installing WSL and Ubuntu (accept the Windows prompt)…");
+                    wsl::install()?;
+                    rep.log("WSL setup finished. If Windows asks for a restart, restart and come back to this page.");
+                }
+                "mirrored" => {
+                    wsl::set_mirrored()?;
+                    rep.log("WSL now shares Windows' network (mirrored mode).");
+                }
+                "firewall" => {
+                    rep.progress(None, "Opening the ports (accept the Windows prompt)…");
+                    wsl::open_firewall(hub::HOME_THREADS)?;
+                    rep.log("Firewall rules added for the hub's ports.");
+                }
+                "build" => {
+                    rep.progress(None, "Building the hub inside Ubuntu (a few minutes)…");
+                    let out = wsl::build_hub(&name)?;
+                    if let Some(line) = out.lines().find(|l| l.starts_with("Hub source:")) {
+                        rep.log(line.to_string());
+                    }
+                    rep.log("Hub built.");
+                }
+                "start" => {
+                    rep.progress(None, "Starting the server…");
+                    wsl::start(&name)?;
+                    rep.log("Server running.");
+                }
+                "stop" => {
+                    wsl::stop()?;
+                    rep.log("Server stopped.");
+                }
+                _ => {}
+            }
+            rep.progress(None, "Checking the setup…");
+            Ok(Extra::Wsl(wsl_status()))
+        });
+    }
+
+    #[cfg(not(windows))]
+    fn server_action(&mut self, _ctx: &egui::Context, _action: &'static str) {}
+
+    fn server_vps(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            ui.label(RichText::new("SET UP A VPS — ABOUT 10 MINUTES").color(ACCENT).strong());
+            ui.label(RichText::new("1. Rent a small Linux server").strong());
+            ui.label(
+                "Any provider works (for example Hetzner, DigitalOcean, Vultr, Linode, OVH). Pick the smallest plan — 1 CPU and 512 MB–1 GB of RAM \
+                 is plenty — with a public IPv4 address and generous traffic, in a region close to both of you. Choose Ubuntu 24.04 (or Debian 13) as the system. \
+                 Set a root password or add an SSH key, and note the server's IP address.",
+            );
+            ui.label(RichText::new("2. Open the ports in the provider's firewall").strong());
+            ui.label("In the provider's panel (Firewall / Security group / Networking), allow incoming UDP 47800 and 47810–47873 (or exactly 47810 plus one port per CPU core).");
+            ui.label(RichText::new("3. Run the setup").strong());
+            ui.label("Easiest: let the helper open a terminal that logs in and runs it — you only type the server's password there.");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Server IP:");
+                ui.add(egui::TextEdit::singleline(&mut self.server.vps_host).desired_width(160.0).hint_text("203.0.113.7"));
+                ui.label("User:");
+                ui.add(egui::TextEdit::singleline(&mut self.server.vps_user).desired_width(80.0));
+                if ui.add_enabled(!self.server.vps_host.trim().is_empty(), egui::Button::new("🖥  Open SSH and run the setup")).clicked() {
+                    if let Err(e) = hub::open_ssh_setup(&self.server.vps_user, &self.server.vps_host) {
+                        self.banner = Some((false, format!("{e:#}")));
+                    }
+                }
+            });
+            ui.label(RichText::new("Or paste this into the provider's web console (or your own SSH window):").color(DIM));
+            let cmd = hub::setup_command(self.server.vps_user.trim() == "root" || self.server.vps_user.trim().is_empty());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(&cmd).monospace().color(CYAN));
+                if ui.small_button("📋 Copy").clicked() {
+                    ui.ctx().copy_text(cmd.clone());
+                }
+            });
+            ui.label(RichText::new("4. Copy the address it prints").strong());
+            ui.label("At the end it prints a line like NIGHTCOOP_HUB_ADDRESS=203.0.113.7#K3QF-9X2M-TV7A-0D4R — paste it into “Use your server” below.");
+            ui.label(RichText::new("Later").strong());
+            ui.label("• Update the hub: run the same command again (the key, and so the fingerprint, stays).");
+            ui.label("• Back up /var/lib/nightcoop/hub-sign.key somewhere safe — it is your server's identity.");
+            ui.label("• Remove it: the same command with  | bash -s -- --uninstall  at the end.");
+        });
+    }
+
+    fn server_linux_pc(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.router_card(ui, ctx);
+        card(ui, |ui| {
+            ui.label(RichText::new("SET UP A LINUX PC").color(ACCENT).strong());
+            ui.label("On an Ubuntu 24.04 / Debian 13 computer, open a terminal and run:");
+            let cmd = hub::setup_command(false);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(&cmd).monospace().color(CYAN));
+                if ui.small_button("📋 Copy").clicked() {
+                    ui.ctx().copy_text(cmd.clone());
+                }
+            });
+            ui.label(
+                "It builds the official hub, runs it as a service that starts with the computer, and prints NIGHTCOOP_HUB_ADDRESS=… at the end. \
+                 Forward the ports on your router to that computer (see above), then paste the address below.",
+            );
         });
     }
 
@@ -1767,6 +2131,128 @@ fn data_sizes() -> (u64, u64, u64) {
     (util::dir_size(&d.join("backups")), util::dir_size(&d.join("rollback")), util::dir_size(&d.join("downloads")) + util::dir_size(&d.join("staging")))
 }
 
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum HostPlace {
+    #[default]
+    ThisPc,
+    Vps,
+    LinuxPc,
+}
+
+#[derive(Default)]
+struct ServerUi {
+    place: HostPlace,
+    router: Option<RouterCheck>,
+    wsl: Option<WslStatus>,
+    /// `host#FINGERPRINT` of the player's own server.
+    address: String,
+    vps_host: String,
+    vps_user: String,
+}
+
+#[derive(Clone)]
+struct RouterCheck {
+    /// (router name, this PC's local address, the router's public address)
+    router: Result<(String, std::net::Ipv4Addr, Option<std::net::Ipv4Addr>), String>,
+    /// The public address the internet sees (STUN).
+    public_ip: Option<std::net::Ipv4Addr>,
+    ports_opened: bool,
+}
+
+impl RouterCheck {
+    /// The router itself sits behind the provider's NAT: a home server can't be reached from outside.
+    fn cgnat(&self) -> bool {
+        match (&self.router, self.public_ip) {
+            (Ok((_, _, Some(ext))), Some(public)) => upnp::is_carrier_or_private(*ext) || *ext != public,
+            (Ok((_, _, Some(ext))), None) => upnp::is_carrier_or_private(*ext),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct WslStatus {
+    installed: bool,
+    distro: bool,
+    mirrored: bool,
+    firewall: bool,
+    built: bool,
+    running: bool,
+    fingerprint: Option<String>,
+    public_ip: Option<String>,
+}
+
+fn router_check(open_ports: Option<bool>) -> RouterCheck {
+    let public_ip = net::public_ip();
+    let mut ports_opened = false;
+    let router = upnp::discover().map_err(|e| format!("{e:#}")).map(|r| {
+        if let Some(open) = open_ports {
+            ports_opened = hub::ports(hub::HOME_THREADS)
+                .into_iter()
+                .map(|p| if open { r.add_udp_port(p, "NightCoop hub") } else { r.remove_udp_port(p) })
+                .all(|res| res.is_ok())
+                && open;
+        }
+        (r.name.clone().unwrap_or_else(|| "your router".into()), r.local_ip, r.external_ip().ok())
+    });
+    RouterCheck { router, public_ip, ports_opened }
+}
+
+#[cfg(windows)]
+fn wsl_status() -> WslStatus {
+    use hub::wsl;
+    let installed = wsl::distros().is_some();
+    let distro = installed && wsl::distro_ready();
+    let built = distro && wsl::hub_built();
+    let running = built && wsl::running();
+    WslStatus {
+        installed,
+        distro,
+        mirrored: wsl::mirrored(),
+        firewall: wsl::firewall_ok(),
+        built,
+        running,
+        fingerprint: if built { wsl::fingerprint() } else { None },
+        public_ip: if running { net::public_ip().map(|ip| ip.to_string()) } else { None },
+    }
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+fn wsl_status() -> WslStatus {
+    WslStatus::default()
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn computer_name() -> String {
+    let n = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "home".into());
+    let n: String = n.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(30).collect::<String>().to_ascii_lowercase();
+    if n.is_empty() { "home".into() } else { n }
+}
+
+/// One numbered step: status mark, title, detail and (when given) a button. Returns true when clicked.
+fn step_row(ui: &mut egui::Ui, n: usize, done: Option<bool>, title: &str, detail: &str, button: Option<&str>, enabled: bool) -> bool {
+    let mut clicked = false;
+    ui.horizontal_wrapped(|ui| {
+        let (icon, color) = match done {
+            Some(true) => ("✔", OK),
+            Some(false) => ("●", WARN),
+            None => ("·", DIM),
+        };
+        ui.label(RichText::new(icon).color(color).size(18.0));
+        ui.label(RichText::new(format!("{n}. {title}")).strong());
+        if let Some(b) = button {
+            if done != Some(true) || b.starts_with("Re") || b.starts_with("Stop") || b.starts_with("Start") {
+                clicked = ui.add_enabled(enabled, egui::Button::new(b)).clicked();
+            }
+        }
+    });
+    ui.label(RichText::new(detail).color(DIM).small());
+    ui.add_space(2.0);
+    clicked
+}
+
 fn fetch_remote(settings: &Settings) -> RemoteInfo {
     let repo = settings.helper_repo.trim();
     let (red4ext, nightcoop, helper) = std::thread::scope(|sc| {
@@ -1805,6 +2291,7 @@ impl eframe::App for App {
                     Page::Versions => self.versions(ui),
                     Page::Saves => self.saves(ui),
                     Page::Together => self.together(ui),
+                    Page::Server => self.server_page(ui),
                     Page::Troubleshoot => self.troubleshoot(ui),
                     Page::Guide => self.guide(ui),
                     Page::Settings => self.settings_page(ui),

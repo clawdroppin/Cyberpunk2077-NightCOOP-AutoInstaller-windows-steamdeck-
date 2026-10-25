@@ -25,12 +25,12 @@ fn is_code(s: &str) -> bool {
     (4..=12).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric()) && s.chars().any(|c| c.is_ascii_digit()) && s.chars().any(|c| c.is_ascii_alphabetic())
 }
 
-fn is_fingerprint(s: &str) -> bool {
+pub fn is_fingerprint(s: &str) -> bool {
     let groups: Vec<&str> = s.split('-').collect();
     groups.len() >= 2 && groups.iter().all(|g| !g.is_empty() && g.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
-fn is_host(s: &str) -> bool {
+pub fn is_host(s: &str) -> bool {
     let host = s.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map(|(h, _)| h).unwrap_or(s);
     !host.is_empty() && host.contains('.') && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
 }

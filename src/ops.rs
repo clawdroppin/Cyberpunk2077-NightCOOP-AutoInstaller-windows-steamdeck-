@@ -53,8 +53,11 @@ fn ensure_game_closed() -> Result<()> {
     Ok(())
 }
 
+/// A fresh scratch folder per use, so two unpacks can never collide.
 fn staging(name: &str) -> PathBuf {
-    config::sub("staging").join(name)
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    config::sub("staging").join(format!("{name}-{}-{n}", std::process::id()))
 }
 
 /// Keeps the download cache small: only the newest few archives stay.
@@ -73,13 +76,42 @@ fn prune_downloads(keep: usize) {
 
 // ---------- mods off / on ----------
 
-/// What "mods off" moves out of the game: RED4ext's loader and its whole folder (NightCoop included).
-fn parkable(game: &Game) -> [(PathBuf, PathBuf); 2] {
+/// What "mods off" moves out of the game: RED4ext's loader, its whole folder (NightCoop included) and any
+/// other files the NightCoop build shipped (`extras`, relative to the game folder).
+fn parkable(game: &Game, extras: &[String]) -> Vec<(PathBuf, PathBuf)> {
     let park = game.park_dir();
-    [
+    let mut items = vec![
         (game.dir.join("bin").join("x64").join("winmm.dll"), park.join("bin").join("x64").join("winmm.dll")),
         (game.red4ext_dir(), park.join("red4ext")),
-    ]
+    ];
+    for rel in extras.iter().filter(|r| !r.starts_with("red4ext/")) {
+        items.push((game.dir.join(rel), park.join(rel)));
+    }
+    items
+}
+
+/// Every file waiting in the park folder, as (parked, live) pairs; `red4ext` moves back as one folder.
+fn parked_items(game: &Game) -> Vec<(PathBuf, PathBuf)> {
+    let park = game.park_dir();
+    let mut items = Vec::new();
+    if park.join("red4ext").exists() {
+        items.push((park.join("red4ext"), game.red4ext_dir()));
+    }
+    let mut stack = vec![park.clone()];
+    while let Some(dir) = stack.pop() {
+        for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p == park.join("red4ext") {
+                continue;
+            }
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(rel) = p.strip_prefix(&park) {
+                items.push((p.clone(), game.dir.join(rel)));
+            }
+        }
+    }
+    items
 }
 
 /// Moves a file or folder, falling back to copy + delete across filesystems.
@@ -101,10 +133,10 @@ fn move_path(from: &Path, to: &Path) -> Result<()> {
 }
 
 /// Turns every RED4ext mod off, leaving a vanilla game. Undo with [`mods_on`].
-pub fn mods_off(game: &Game, rep: &Reporter) -> Result<()> {
+pub fn mods_off(game: &Game, extras: &[String], rep: &Reporter) -> Result<()> {
     ensure_game_closed()?;
     let mut moved = 0;
-    for (live, parked) in parkable(game) {
+    for (live, parked) in parkable(game, extras) {
         if live.exists() {
             if parked.exists() {
                 if parked.is_dir() { fs::remove_dir_all(&parked)? } else { fs::remove_file(&parked)? }
@@ -122,10 +154,7 @@ pub fn mods_off(game: &Game, rep: &Reporter) -> Result<()> {
 
 pub fn mods_on(game: &Game, rep: &Reporter) -> Result<()> {
     ensure_game_closed()?;
-    for (live, parked) in parkable(game) {
-        if !parked.exists() {
-            continue;
-        }
+    for (parked, live) in parked_items(game) {
         if live.exists() {
             // Something was reinstalled meanwhile; the newer live copy wins.
             rep.log(format!("{} already exists; keeping it.", live.display()));
@@ -398,7 +427,7 @@ pub fn install_nightcoop_archive(
 
     // Work out where the plugin lives in the archive.
     let plugin_src: PathBuf;
-    let mut extra_roots: Vec<PathBuf> = Vec::new();
+    let mut game_root: Option<PathBuf> = None;
     let mut bundle_root: Option<PathBuf> = None;
     if let Some(root) = find_red4ext_root(&stage, 3) {
         let dll = find_file(&root.join("red4ext"), "NightCoop.dll", 3).ok_or_else(|| anyhow!("NightCoop.dll not found in the archive's red4ext folder"))?;
@@ -407,14 +436,7 @@ pub fn install_nightcoop_archive(
         if root.join("red4ext").join("RED4ext.dll").is_file() && root.join("bin").join("x64").join("winmm.dll").is_file() {
             bundle_root = Some(root.clone());
         }
-        // Other game-root folders shipped next to red4ext (archive mods, scripts…).
-        // `bin` is left out: the loader in it is handled with the bundled RED4ext.
-        for name in ["archive", "r6", "engine", "mods"] {
-            let p = root.join(name);
-            if p.is_dir() {
-                extra_roots.push(p);
-            }
-        }
+        game_root = Some(root);
     } else if let Some(dll) = find_file(&stage, "NightCoop.dll", 4) {
         plugin_src = dll.parent().unwrap().to_path_buf();
     } else {
@@ -453,10 +475,8 @@ pub fn install_nightcoop_archive(
         fs::remove_dir_all(&dest).with_context(|| format!("cannot remove old {}", dest.display()))?;
     }
     let n = util::copy_merge(&plugin_src, &dest)?.len();
-    for root in &extra_roots {
-        let name = root.file_name().unwrap();
-        util::copy_merge(root, &game.dir.join(name))?;
-        rep.log(format!("Also installed the archive's {} folder.", name.to_string_lossy()));
+    if let Some(root) = &game_root {
+        install_build_extras(game, root, &plugin_src, bundle_root.is_some(), state, rep)?;
     }
     for (name, bytes) in &kept {
         fs::write(dest.join(name), bytes)?;
@@ -481,6 +501,53 @@ pub fn install_nightcoop_archive(
     state.installed_at = Some(util::timestamp());
     state.game_build_id = game.steam.as_ref().and_then(|g| g.build_id.clone());
     rep.log(format!("NightCoop {version} installed ({n} files){}.", if kept.is_empty() { "" } else { ", your servers.txt was kept" }));
+    Ok(())
+}
+
+/// Installs everything else a build ships — the official instructions say "unpack the whole archive into
+/// the game folder" — so future builds that add plugins, archive/r6 mods or loader files just work.
+/// RED4ext's own files are left to [`install_bundled_red4ext`] (the bundled/custom choice), and files the
+/// previous build shipped but this one doesn't are removed. Everything is recorded for uninstall and Mods off.
+fn install_build_extras(game: &Game, root: &Path, plugin_src: &Path, red4ext_handled: bool, state: &mut InstallState, rep: &Reporter) -> Result<()> {
+    let plugin_rel = plugin_src.strip_prefix(root).unwrap_or(plugin_src).to_path_buf();
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in fs::read_dir(&dir)?.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                if path != plugin_src {
+                    stack.push(path);
+                }
+                continue;
+            }
+            let rel = path.strip_prefix(root)?.to_path_buf();
+            let key = rel.to_string_lossy().replace('\\', "/");
+            // RED4ext's own files follow the bundled/custom choice — when we recognised the bundle. A build that
+            // loads RED4ext some new way gets all its files installed as they come.
+            let red4ext_own = red4ext_handled && ((key.starts_with("red4ext/") && key.matches('/').count() == 1) || key.eq_ignore_ascii_case("bin/x64/winmm.dll"));
+            // Loose files next to the folders (readme…) are not part of the game.
+            if !key.contains('/') || red4ext_own || rel.starts_with(&plugin_rel) {
+                continue;
+            }
+            let to = game.dir.join(&rel);
+            if let Some(p) = to.parent() {
+                fs::create_dir_all(p)?;
+            }
+            fs::copy(&path, &to).with_context(|| format!("cannot write {}", to.display()))?;
+            files.push(key);
+        }
+    }
+    for old in &state.nightcoop_extra_files {
+        if !files.contains(old) {
+            let _ = fs::remove_file(game.dir.join(old));
+        }
+    }
+    if !files.is_empty() {
+        rep.log(format!("Also installed {} other file(s) the build ships.", files.len()));
+    }
+    files.sort();
+    state.nightcoop_extra_files = files;
     Ok(())
 }
 
@@ -568,6 +635,9 @@ pub fn uninstall_nightcoop(game: &Game, state: &mut InstallState, rep: &Reporter
             }
             fs::remove_dir_all(&dir)?;
         }
+    }
+    for f in std::mem::take(&mut state.nightcoop_extra_files) {
+        let _ = fs::remove_file(game.dir.join(f));
     }
     state.nightcoop_version = None;
     state.nightcoop_dll_sha256 = None;
@@ -713,6 +783,13 @@ mod tests {
     use crate::game::Store;
     use std::io::Write as _;
 
+    /// Install tests share the helper's rollback list: run them one at a time.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn reporter() -> Reporter {
         let (tx, _rx) = std::sync::mpsc::channel();
         // Keep the receiver alive for the whole test so sends don't fail.
@@ -730,7 +807,59 @@ mod tests {
     }
 
     #[test]
+    fn future_builds_with_extra_files() {
+        let _serial = serial();
+        let root = std::env::temp_dir().join(format!("nchelper-extras-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let game_dir = root.join("Cyberpunk 2077");
+        fs::create_dir_all(game_dir.join("bin/x64")).unwrap();
+        fs::write(game_dir.join("bin/x64/Cyberpunk2077.exe"), b"MZ").unwrap();
+        let game = Game { dir: game_dir.clone(), store: Store::Manual, steam: None };
+        let rep = reporter();
+        let mut state = InstallState::default();
+
+        // A build that also ships another plugin, an archive mod, an extra loader file and a readme.
+        let v1 = root.join("v1.zip");
+        make_zip(&v1, &[
+            ("bin/x64/winmm.dll", b"loader"),
+            ("bin/x64/extra.dll", b"x"),
+            ("red4ext/RED4ext.dll", b"r4"),
+            ("red4ext/plugins/NightCoop/NightCoop.dll", b"nc1"),
+            ("red4ext/plugins/Helper/Helper.dll", b"h"),
+            ("archive/pc/mod/nightcoop.archive", b"a"),
+            ("README.txt", b"readme"),
+        ]);
+        install_nightcoop_archive(&game, &v1, Some("1".into()), None, &mut state, &rep).unwrap();
+        for f in ["bin/x64/extra.dll", "red4ext/plugins/Helper/Helper.dll", "archive/pc/mod/nightcoop.archive"] {
+            assert!(game_dir.join(f).is_file(), "{f} installed");
+            assert!(state.nightcoop_extra_files.iter().any(|x| x == f), "{f} tracked");
+        }
+        assert!(!game_dir.join("README.txt").exists());
+        assert!(game_dir.join("bin/x64/winmm.dll").is_file() && game.red4ext_dir().join("RED4ext.dll").is_file());
+
+        // Mods off parks the extras too; mods on brings everything back.
+        mods_off(&game, &state.nightcoop_extra_files.clone(), &rep).unwrap();
+        assert!(!game_dir.join("archive/pc/mod/nightcoop.archive").exists() && !game_dir.join("bin/x64/extra.dll").exists());
+        mods_on(&game, &rep).unwrap();
+        assert!(game_dir.join("archive/pc/mod/nightcoop.archive").is_file() && game_dir.join("bin/x64/extra.dll").is_file());
+        assert!(!game.park_dir().exists());
+
+        // The next build drops the archive mod: it must not linger.
+        let v2 = root.join("v2.zip");
+        make_zip(&v2, &[("red4ext/RED4ext.dll", b"r4"), ("bin/x64/winmm.dll", b"loader"), ("red4ext/plugins/NightCoop/NightCoop.dll", b"nc2"), ("bin/x64/extra.dll", b"x")]);
+        install_nightcoop_archive(&game, &v2, Some("2".into()), None, &mut state, &rep).unwrap();
+        assert!(!game_dir.join("archive/pc/mod/nightcoop.archive").exists());
+        assert_eq!(state.nightcoop_extra_files, vec!["bin/x64/extra.dll".to_string()]);
+
+        // Uninstall removes the extras with the plugin.
+        uninstall_nightcoop(&game, &mut state, &rep).unwrap();
+        assert!(!game_dir.join("bin/x64/extra.dll").exists() && state.nightcoop_extra_files.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn full_install_cycle() {
+        let _serial = serial();
         let root = std::env::temp_dir().join(format!("nchelper-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let game_dir = root.join("Cyberpunk 2077");
@@ -778,7 +907,7 @@ mod tests {
         assert!(game.plugin_dir().join("NightCoop.dll").is_file());
 
         // Mods off: a vanilla game, versions still visible, and back on again.
-        mods_off(&game, &rep).unwrap();
+        mods_off(&game, &state.nightcoop_extra_files.clone(), &rep).unwrap();
         assert!(!game_dir.join("bin/x64/winmm.dll").exists() && !game.red4ext_dir().exists());
         let st = crate::game::Status::scan(&settings, &state);
         assert!(st.mods_off && st.nightcoop_installed && st.loader_present && !st.ready());
@@ -789,7 +918,7 @@ mod tests {
         // Installing while mods are off brings them back first. Reinstalling the same build is a repair:
         // it must not add a rollback copy of itself.
         let rollbacks_before = list_rollbacks().len();
-        mods_off(&game, &rep).unwrap();
+        mods_off(&game, &state.nightcoop_extra_files.clone(), &rep).unwrap();
         install_nightcoop_archive(&game, &nc2, Some("0.2.0".into()), None, &mut state, &rep).unwrap();
         assert_eq!(list_rollbacks().len(), rollbacks_before);
         assert!(!game.park_dir().exists() && game_dir.join("bin/x64/winmm.dll").is_file());
@@ -846,6 +975,7 @@ mod tests {
     #[test]
     #[ignore = "downloads the real NightCoop build"]
     fn real_nightcoop_install() {
+        let _serial = serial();
         let root = std::env::temp_dir().join(format!("nchelper-nc-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let game_dir = root.join("Cyberpunk 2077");

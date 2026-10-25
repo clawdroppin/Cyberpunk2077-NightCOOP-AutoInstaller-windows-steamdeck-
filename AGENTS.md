@@ -31,7 +31,10 @@ one-button flow working without a terminal.
 | `src/steam.rs` | Steam roots & libraries, `appmanifest`, launch-option merge/strip, process detection, Steam shutdown/start, Deck detection. |
 | `src/remote.rs` | Release feeds: GitHub releases API (RED4ext, helper) and `https://nightcoop.net/releases.json`. |
 | `src/invite.rs` | Finds NightCoop invites (`CODE@host[:port]#FINGERPRINT` or a bare code) in pasted text; builds the "message for my partner". |
-| `src/net.rs` | Connection check: resolves `hub.nightcoop.net`, STUN binding requests to the public servers the mod uses → UDP works? strict NAT? |
+| `src/net.rs` | Connection check: resolves `hub.nightcoop.net`, STUN binding requests to the public servers the mod uses → UDP works? strict NAT? `public_ip()`. |
+| `src/upnp.rs` | UPnP IGD client (SSDP + SOAP, no deps): router discovery, external address (CGNAT check), add/remove UDP port mappings. |
+| `src/hub.rs` | Self-hosted hub: embeds `scripts/nightcoop-hub-setup.sh`, address parsing (`host#FINGERPRINT`), `hub.txt` "use in my game", SSH launcher for a VPS, and `hub::wsl` (Windows): WSL/Ubuntu install, mirrored networking (`.wslconfig`), firewall (Windows + Hyper-V rules, elevated via one UAC prompt), build, start/stop, fingerprint, key backup/restore. |
+| `scripts/nightcoop-hub-setup.sh` | One-command hub setup for Ubuntu 24.04+/Debian 13+ (VPS, Linux PC, WSL with `--no-service`). Builds the official hub source (ENet commit read from the official guide), systemd service, ufw, sysctl, prints `NIGHTCOOP_HUB_ADDRESS=ip#fp`. Served from this repo's `main` branch — keep the path stable. |
 | `src/vdf.rs` | Text KeyValues parser/writer that preserves raw escaping (round-trips Steam files). |
 | `src/shortcuts.rs` | Binary `shortcuts.vdf` reader/writer for "Add to Steam". |
 | `src/selfupdate.rs` | Helper self-update from this repo's GitHub releases. `HOME_REPO` lives here. |
@@ -78,7 +81,7 @@ one-button flow working without a terminal.
 cargo test                      # unit + fake-game install cycle (no network)
 cargo test -- --include-ignored # also installs real RED4ext and the live NightCoop build into temp folders
 cargo run                       # debug GUI
-$env:NCH_PAGE="versions"; cargo run   # open a page directly: home, play (together), versions, saves, troubleshoot, guide, settings
+$env:NCH_PAGE="versions"; cargo run   # open a page directly: home, play (together), versions, saves, host (server), troubleshoot, guide, settings
 .\build.ps1                     # full release build into dist\
 ```
 
@@ -135,6 +138,19 @@ print([t.needed for s in f.iter_sections() if s.name == ".dynamic" for t in s.it
 
 `cargo test -- --include-ignored` runs `real_nightcoop_install`, which installs the live latest build into a temp folder.
 
+## Self-hosted hub facts
+
+- Hub CLI (official): `nightcoop_hub <port> --shards N --max-clients 512 --sign-key-auto <key> --hub-name X --region Y`;
+  thread ports are `port+10 … port+10+N-1`; `--hub-public <key>` prints `# fingerprint XXXX-XXXX-XXXX-XXXX`. The key is created
+  on first start (mode 0600) and is the server's identity — the helper backs it up from WSL and restores it after a reinstall.
+- Home/WSL uses `--shards 2` → UDP 47800, 47810, 47811. A VPS uses `auto` (one thread per core).
+- WSL2 needs **mirrored networking** so the hub sees players' real addresses and forwarded ports reach it, plus a **Hyper-V
+  firewall** rule (VMCreatorId `{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}`) besides the normal Windows Firewall rule.
+- The game is pointed at a server by writing `address#fingerprint` to `hub.txt` next to `NightCoop.dll` (the mod moves it into
+  its own servers on the next start — documented in the official hub guide).
+- The script's build steps were verified by cross-compiling the official source with zig (`x86_64-linux-gnu`); the full script,
+  the WSL steps and the UPnP port mapping have **not** been run end-to-end yet (no Linux box / WSL on the dev PC; router left alone).
+
 ## Open items
 
 - [x] On the Deck: "Install everything" from Desktop Mode wrote the launch option; the loader ran (winmm.dll loaded under Proton).
@@ -142,10 +158,22 @@ print([t.needed for s in f.iter_sections() if s.name == ".dynamic" for t in s.it
 - [ ] "Add to Steam" shortcut appears in Gaming Mode and launches.
 - [ ] File picker (xdg-desktop-portal) works in Desktop Mode.
 - [ ] NightCoop officially supports Windows 10/11 only; collect Deck/Proton reports.
+- [ ] Host a server: run the WSL path end-to-end on a real PC (install, first start without OOBE, mirrored mode, firewall, build,
+      start, reachable from outside), the setup script on a fresh Ubuntu 24.04 VPS, and UPnP add/remove on a real router.
 - Ideas: Windows exe/window icon, Proton version recommendation, detect Heroic/Lutris installs on Linux,
   controller-friendly focus navigation for Gaming Mode, identify manually installed builds by hashing the DLL inside cached zips.
 
 ## Changelog
+
+- **0.5.0** — **Host a server** page: WSL2 automation on Windows (install, mirrored networking, firewall, build, start/stop,
+  fingerprint, key backup), VPS guide + one-command setup script (`scripts/nightcoop-hub-setup.sh`) with an SSH launcher,
+  Linux PC path, router check via UPnP (CGNAT detection, automatic port forwarding), "Use this server in my game" (`hub.txt`).
+  Future-proofing: installs mirror "unpack the whole archive" — every file a build ships is installed and tracked (other
+  plugins, archive/r6 mods, loader files), stale ones removed on update, all covered by uninstall and Mods off; RED4ext files
+  are installed as-is when a build loads RED4ext some new way; a newer release-list format is flagged; the helper's own update
+  check falls back to github.com when the API is rate-limited (still SHA-256 verified via SHA256SUMS.txt). Fixes: the VC++
+  runtime step runs before the Steam step (a Steam failure no longer skips it); never offers a Steam restart in Gaming Mode.
+  Verified against NightCoop 0.1.1-beta.2 (same layout, build id `8b2fe3e`).
 
 - **0.4.1** — Fix for "RED4ext (error 998) / RED4ext could not be loaded" on the Steam Deck: the helper detects and installs
   Microsoft's Visual C++ runtime into the game's Proton prefix (plus winetricks-style DLL overrides) during "Install everything",

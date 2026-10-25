@@ -64,7 +64,7 @@ Press the same button again whenever an update is out — it only replaces what 
 <div align="center">
 <img src="docs/screenshots/together.png" alt="Play together page" width="32%">
 <img src="docs/screenshots/mods.png" alt="Mods and versions page" width="32%">
-<img src="docs/screenshots/guide.png" alt="Steam Deck guide page" width="32%">
+<img src="docs/screenshots/host.png" alt="Host a server page" width="32%">
 </div>
 
 ---
@@ -114,6 +114,30 @@ Open **👥 Play together** in the helper — it walks you through it:
 - Saves made with **Phantom Liberty** won't load in a session hosted without it.
 - **Steam Deck: paste with one button.** In Cyberpunk's controller layout, bind a back button (e.g. L4) to **V** and add a second command **Left Ctrl** — that's Ctrl+V for pasting invites. STEAM + X opens the on-screen keyboard.
 - Tip from the NightCoop docs: play in **Borderless window**; exclusive fullscreen freezes for a second on Alt+Tab.
+
+## 🖥 Host your own server (optional)
+
+NightCoop players meet through a **hub** — a small server that hands out session codes, helps players connect directly, and relays the game when no direct path opens. The official hubs work for most people. Your own is for when they're far away or unreliable for you. *(Playing from the same home? You don't need one.)*
+
+The helper's **🖥 Host a server** page sets one up three ways:
+
+| Where | What the helper does |
+|---|---|
+| **This Windows PC** (WSL2) | One button per step: installs WSL + Ubuntu 24.04, switches WSL to mirrored networking, opens Windows' and WSL's firewall, builds the official hub inside Ubuntu, then **Start / Stop**. Shows your fingerprint and backs up the hub's key. |
+| **A cheap Linux VPS** (~$5/month) | Step-by-step guide, then **one command** — or a button that opens SSH and runs it for you. |
+| **Another Linux PC** | The same one command. |
+
+For a home server it also **checks your router** (UPnP): finds this PC's address, tells you if your provider uses CGNAT (then a home server can't work — use a VPS), and can **open the ports automatically** — UDP **47800** and **47810–47811**. A **Use this server in my game** button points your game at it; your partner just pastes your invite as usual.
+
+**The one command** (Ubuntu 24.04+ / Debian 13+, follows the [official guide](https://github.com/Twenfys/nightcoop-hub/blob/HEAD/tools/hub/docker/README.md) without Docker):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/clawdroppin/Cyberpunk2077-NightCOOP-AutoInstaller-windows-steamdeck-/main/scripts/nightcoop-hub-setup.sh | sudo bash
+```
+
+It installs the build tools, builds the official hub from its source, runs it as a service, opens `ufw` if active, and prints `NIGHTCOOP_HUB_ADDRESS=<ip>#<fingerprint>` — paste that into the helper. Run it again to update (same key, same fingerprint); add `| sudo bash -s -- --uninstall` to remove. Back up `/var/lib/nightcoop/hub-sign.key`.
+
+On a VPS, also allow **UDP 47800 and 47810–47873** in the provider's firewall panel.
 
 ## 🛠 Troubleshooting
 
