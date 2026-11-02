@@ -114,6 +114,10 @@ pub struct NcFile {
     pub size: Option<u64>,
     pub sha256: Option<String>,
     pub mirrors: Vec<String>,
+    /// Game versions this file is for, when a release ships one zip per game version (0.1.2-beta+).
+    pub game: Vec<String>,
+    /// RED4ext bundled in this file.
+    pub red4ext: Option<String>,
 }
 
 /// Site text is either a plain string or {"en": ..., "ru": ...}.
@@ -140,6 +144,26 @@ impl NcRelease {
     }
     pub fn mod_file(&self) -> Option<&NcFile> {
         self.files.iter().find(|f| f.kind.as_deref() == Some("mod")).or_else(|| self.files.first())
+    }
+    /// The mod download for this game version. Releases may ship one zip per game version; with
+    /// several and none matching, there is no right file (`None`) rather than a wrong one.
+    pub fn mod_file_for(&self, game_version: Option<&str>) -> Option<&NcFile> {
+        let mut mods: Vec<&NcFile> = self.files.iter().filter(|f| f.kind.as_deref() == Some("mod")).collect();
+        if mods.is_empty() {
+            mods.extend(self.files.first());
+        }
+        if mods.len() <= 1 {
+            return mods.first().copied();
+        }
+        let generic = mods.iter().find(|f| f.game.is_empty()).copied();
+        match game_version {
+            Some(gv) => mods.iter().find(|f| f.game.iter().any(|g| util::version_covers(g, gv))).copied().or(generic),
+            None => generic.or(mods.first().copied()),
+        }
+    }
+    /// Game versions that have their own download in this release.
+    pub fn file_game_versions(&self) -> Vec<String> {
+        self.files.iter().flat_map(|f| f.game.iter().cloned()).collect()
     }
     pub fn protocol_str(&self) -> Option<String> {
         match &self.protocol {
@@ -263,6 +287,19 @@ mod tests {
         assert_eq!(m.latest_for(Channel::Stable).unwrap().version, "0.1.0");
         assert_eq!(m.releases[0].yank_reason().unwrap(), "crash");
         assert_eq!(m.releases[1].notes_text().unwrap(), "• one\n• two");
+
+        // 0.1.2-beta: one zip per game version.
+        let per_game: NcRelease = serde_json::from_str(
+            r#"{"version":"0.1.2-beta","game":["2.5","2.31"],"files":[
+            {"kind":"mod","game":["2.5"],"url":"a-2.5.zip","red4ext":"1.31.0"},
+            {"kind":"mod","game":["2.31"],"url":"a-2.31.zip","red4ext":"1.30.0"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(per_game.mod_file_for(Some("2.5")).unwrap().url, "a-2.5.zip");
+        assert_eq!(per_game.mod_file_for(Some("2.31")).unwrap().url, "a-2.31.zip");
+        assert!(per_game.mod_file_for(Some("2.3")).is_none(), "no wrong file for an unsupported game");
+        assert_eq!(per_game.mod_file_for(None).unwrap().url, "a-2.5.zip");
+        assert_eq!(m.releases[1].mod_file_for(Some("9.9")).unwrap().url, "b.zip", "a single file fits every game");
 
         let empty: NcManifest = serde_json::from_str(r#"{"schema":1,"updated":"x","latest":null,"releases":[]}"#).unwrap();
         assert!(empty.latest_for(Channel::Stable).is_none());

@@ -47,7 +47,8 @@ impl Reporter {
 }
 
 fn ensure_game_closed() -> Result<()> {
-    if steam::game_running() {
+    // Tests install into fake game folders; a real game open on the dev PC doesn't matter there.
+    if !cfg!(test) && steam::game_running() {
         bail!("Cyberpunk 2077 is running. Quit the game first.");
     }
     Ok(())
@@ -359,7 +360,18 @@ pub fn uninstall_red4ext(game: &Game, state: &mut InstallState, rep: &Reporter) 
 // ---------- NightCoop ----------
 
 pub fn install_nightcoop_release(game: &Game, rel: &NcRelease, manifest_url: &str, state: &mut InstallState, rep: &Reporter) -> Result<()> {
-    let file = rel.mod_file().ok_or_else(|| anyhow!("NightCoop {} has no download", rel.version))?;
+    let game_version = util::pe_version(&game.exe());
+    let file = rel.mod_file_for(game_version.as_deref()).ok_or_else(|| {
+        anyhow!(
+            "NightCoop {} has no download for your game version ({}); it has builds for {}. Update Cyberpunk, or pick another NightCoop version.",
+            rel.version,
+            game_version.as_deref().unwrap_or("unknown"),
+            rel.file_game_versions().join(", ")
+        )
+    })?;
+    if !file.game.is_empty() {
+        rep.log(format!("Using the NightCoop {} build made for game {}.", rel.version, file.game.join("/")));
+    }
     let dest = config::sub("downloads").join(format!("nightcoop-{}-{}", rel.version, file.file_name()));
     let mut last_err = None;
     for url in file.urls(manifest_url) {
@@ -765,7 +777,7 @@ pub fn bug_report(game: Option<&Game>, diagnostics: &str, rep: &Reporter) -> Res
     zip.start_file("diagnostics.txt", opts)?;
     std::io::Write::write_all(&mut zip, diagnostics.as_bytes())?;
     if let Some(g) = game {
-        for (dir, name) in [(g.red4ext_dir().join("logs"), "red4ext-logs"), (g.plugin_dir().join("logs"), "nightcoop-logs")] {
+        for (dir, name) in [(g.active_red4ext_dir().join("logs"), "red4ext-logs"), (g.active_plugin_dir().join("logs"), "nightcoop-logs")] {
             if dir.is_dir() {
                 let n = util::zip_dir(&mut zip, &dir, name)?;
                 rep.log(format!("Added {n} files from {}", dir.display()));

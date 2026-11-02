@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod ai;
 mod app;
 mod config;
 mod game;
@@ -18,6 +19,13 @@ mod vdf;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    // "Start the server when this computer starts": run the hub, no window.
+    if std::env::args().any(|a| a == "--start-hub") {
+        if let Err(e) = hub::start(&hub::computer_name()) {
+            let _ = std::fs::write(config::sub("logs").join("hub-autostart.log"), format!("{e:#}"));
+        }
+        return Ok(());
+    }
     selfupdate::cleanup();
     // Leftovers of installs that were interrupted (power off, crash).
     let _ = std::fs::remove_dir_all(config::data_dir().join("staging"));

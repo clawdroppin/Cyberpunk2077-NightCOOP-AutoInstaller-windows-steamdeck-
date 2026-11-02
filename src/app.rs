@@ -5,11 +5,13 @@ use crate::game::{self, Status};
 use crate::ops::{self, Event, Reporter};
 use crate::remote::{self, GhRelease, NcManifest};
 use crate::selfupdate::{self, HelperUpdate};
-use crate::{hub, invite, net, shortcuts, steam, upnp, util};
+use crate::{ai, hub, invite, net, shortcuts, steam, upnp, util};
 use anyhow::{anyhow, Result};
 use eframe::egui::{self, Color32, RichText};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -28,12 +30,13 @@ enum Page {
     Together,
     Server,
     Troubleshoot,
+    Ai,
     Guide,
     Settings,
 }
 
 impl Page {
-    const ALL: [Page; 8] = [Page::Home, Page::Together, Page::Versions, Page::Saves, Page::Server, Page::Troubleshoot, Page::Guide, Page::Settings];
+    const ALL: [Page; 9] = [Page::Home, Page::Together, Page::Versions, Page::Saves, Page::Server, Page::Troubleshoot, Page::Ai, Page::Guide, Page::Settings];
     fn label(self) -> &'static str {
         match self {
             Page::Home => "🏠  Home",
@@ -42,6 +45,7 @@ impl Page {
             Page::Together => "👥  Play together",
             Page::Server => "🖥  Host a server",
             Page::Troubleshoot => "🔧  Troubleshoot",
+            Page::Ai => "💬  AI helper",
             Page::Guide => "🎮  Deck Guide",
             Page::Settings => "⚙  Settings",
         }
@@ -53,6 +57,8 @@ struct RemoteInfo {
     red4ext: Option<Result<Vec<GhRelease>, String>>,
     nightcoop: Option<Result<NcManifest, String>>,
     helper: Option<Result<Option<HelperUpdate>, String>>,
+    /// Newest commit of the official hub source (only looked up when a hub is built here).
+    hub: Option<Result<String, String>>,
     checked_at: Option<String>,
 }
 
@@ -63,8 +69,7 @@ enum Extra {
     HelperUpdated,
     Connection(net::CheckResult),
     Router(RouterCheck),
-    #[cfg_attr(not(windows), allow(dead_code))]
-    Wsl(WslStatus),
+    Hub(HubStatus),
 }
 
 struct JobDone {
@@ -120,13 +125,20 @@ pub struct App {
     data_sizes: Option<(u64, u64, u64)>,
     /// Any Steam install found (cached; looking it up hits the disk).
     steam_found: bool,
+    ai: AiUi,
+    /// The official hub source changed and the player wants the server kept up to date.
+    hub_update_due: bool,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::with_ctx(&cc.egui_ctx)
+    }
+
+    fn with_ctx(ctx: &egui::Context) -> Self {
         let settings = Settings::load();
         let state = InstallState::load();
-        style(&cc.egui_ctx, settings.ui_scale);
+        style(ctx, settings.ui_scale);
         let status = Status::scan(&settings, &state);
         let mut app = App {
             path_input: settings.game_path.clone(),
@@ -153,6 +165,8 @@ impl App {
             server: ServerUi { vps_user: "root".into(), ..Default::default() },
             data_sizes: None,
             steam_found: !steam::steam_roots().is_empty(),
+            ai: AiUi::default(),
+            hub_update_due: false,
         };
         // NCH_PAGE=versions|saves|… opens a page directly (handy for screenshots and testing).
         if let Ok(p) = std::env::var("NCH_PAGE") {
@@ -161,7 +175,7 @@ impl App {
             }
         }
         if app.settings.check_updates_on_start {
-            app.check_updates(&cc.egui_ctx);
+            app.check_updates(ctx);
         }
         app
     }
@@ -231,17 +245,17 @@ impl App {
                             Extra::HelperUpdated => self.helper_restart_ready = true,
                             Extra::Connection(r) => self.connection = Some(r),
                             Extra::Router(r) => self.server.router = Some(r),
-                            Extra::Wsl(w) => {
-                                if let (Some(fp), Some(ip)) = (&w.fingerprint, &w.public_ip) {
+                            Extra::Hub(h) => {
+                                if let (Some(fp), Some(ip)) = (&h.fingerprint, &h.public_ip) {
                                     if hub::parse_address(&self.server.address).is_none() {
                                         self.server.address = format!("{ip}#{fp}");
                                     }
                                 }
-                                self.server.wsl = Some(w);
+                                self.server.hub = Some(h);
                             }
                             Extra::None => {}
                         }
-                        if !["Checking for updates", "Checking the connection", "Checking your network", "Checking the server setup"].contains(&job.title.as_str()) {
+                        if !["Checking for updates", "Checking the connection", "Checking your network", "Checking the server setup", "Changing server autostart"].contains(&job.title.as_str()) {
                             self.banner = Some((true, format!("{} — done.", job.title)));
                         }
                     }
@@ -251,9 +265,13 @@ impl App {
                     }
                 }
             }
-            Err(_) => self.banner = Some((false, format!("{} crashed unexpectedly.", job.title))),
+            Err(_) => {
+                self.log.push(format!("ERROR: {} crashed unexpectedly.", job.title));
+                self.banner = Some((false, format!("{} crashed unexpectedly.", job.title)));
+            }
         }
         self.rescan();
+        self.ai_job_finished();
     }
 
     fn merge_remote(&mut self, info: RemoteInfo) {
@@ -266,6 +284,17 @@ impl App {
         }
         if info.helper.is_some() {
             self.remote.helper = info.helper;
+        }
+        if let Some(Ok(latest)) = &info.hub {
+            if hub::update_available(latest) {
+                self.hub_update_due = self.settings.hub_auto_update;
+                if let Some(h) = &mut self.server.hub {
+                    h.update_available = true;
+                }
+            }
+        }
+        if info.hub.is_some() {
+            self.remote.hub = info.hub;
         }
         if info.checked_at.is_some() {
             self.remote.checked_at = info.checked_at;
@@ -390,7 +419,16 @@ impl App {
             match &info.nightcoop {
                 Some(Ok(m)) => match m.latest_for(settings.channel) {
                     Some(rel) => {
-                        let current = nc_installed_version.as_deref().map(|v| util::same_version(v, &rel.version)).unwrap_or(false);
+                        // Same version but a zip made for another game version (the game was updated)?
+                        let wanted_sha = rel.mod_file_for(util::pe_version(&game.exe()).as_deref()).and_then(|f| f.sha256.clone());
+                        let right_file = match (&wanted_sha, &state.nightcoop_sha256) {
+                            (Some(w), Some(have)) => w.eq_ignore_ascii_case(have),
+                            _ => true,
+                        };
+                        if !right_file {
+                            rep.log(format!("The installed NightCoop {} was made for another game version; switching to the right one.", rel.version));
+                        }
+                        let current = right_file && nc_installed_version.as_deref().map(|v| util::same_version(v, &rel.version)).unwrap_or(false);
                         // With the bundled choice, RED4ext must match what the build ships.
                         let r4_matches = state.red4ext_custom
                             || matches!((&state.red4ext_bundled, ops::installed_red4ext(&game)), (Some(b), Some(i)) if util::same_version(b, &i));
@@ -588,6 +626,16 @@ impl App {
                         self.state.game_build_id = self.status.steam_build.clone();
                         self.state.save();
                         self.status.game_updated = false;
+                    }
+                });
+            });
+        }
+        if !self.settings.hub_auto_update && matches!(&self.remote.hub, Some(Ok(c)) if hub::update_available(c)) {
+            card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("A newer version of the NightCoop hub (your server) is out.").color(CYAN));
+                    if ui.add_enabled(!self.busy(), egui::Button::new("⬆  Update the server")).clicked() {
+                        self.server_action(&ctx, "update");
                     }
                 });
             });
@@ -876,7 +924,8 @@ impl App {
                         if let Some(b) = &r.build {
                             meta.push(format!("Build {b}"));
                         }
-                        if let Some(sz) = r.mod_file().and_then(|f| f.size) {
+                        let file = r.mod_file_for(self.status.game_version.as_deref());
+                        if let Some(sz) = file.and_then(|f| f.size) {
                             meta.push(util::human_size(sz));
                         }
                         if !meta.is_empty() {
@@ -895,7 +944,10 @@ impl App {
                                 ui.label(n);
                             });
                         }
-                        if r.mod_file().is_some() {
+                        if r.mod_file().is_some() && file.is_none() {
+                            ui.label(RichText::new(format!("No download for your game version — this build comes for game {} only.", r.file_game_versions().join(", "))).color(WARN));
+                        }
+                        if file.is_some() {
                             let label = if r.is_yanked() { "Install anyway" } else { "Install this version" };
                             if ui.add_enabled(!self.busy(), egui::Button::new(label)).clicked() {
                                 self.confirm = Some(Confirm::InstallNcVersion(r.version.clone()));
@@ -1134,7 +1186,7 @@ impl App {
                 }
             }
             ui.label(RichText::new(
-                "Steam uploads saves by itself when you quit the game, and downloads them when you start it — there is no button to force it. To sync now: start Cyberpunk, wait for the main menu, quit normally. Make sure “Keep game saves in the Steam Cloud” is on in Cyberpunk → Properties → General. Steam Cloud mirrors mistakes too, so the backups above                  are your undo button.",
+                "Steam uploads saves by itself when you quit the game, and downloads them when you start it — there is no button to force it. To sync now: start Cyberpunk, wait for the main menu, quit normally. Make sure “Keep game saves in the Steam Cloud” is on in Cyberpunk → Properties → General. Steam Cloud mirrors mistakes too, so the backups above are your undo button.",
             )
             .color(DIM)
             .small());
@@ -1357,12 +1409,12 @@ impl App {
         card(ui, |ui| {
             ui.label(RichText::new("WHERE SHOULD THE SERVER RUN?").color(ACCENT).strong());
             ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(&mut self.server.place, HostPlace::ThisPc, if cfg!(windows) { "This Windows PC (WSL2)" } else { "This PC" });
+                ui.selectable_value(&mut self.server.place, HostPlace::ThisPc, "This computer");
                 ui.selectable_value(&mut self.server.place, HostPlace::Vps, "A cheap Linux VPS (~$5/month)");
                 ui.selectable_value(&mut self.server.place, HostPlace::LinuxPc, "Another Linux computer");
             });
             let hint = match self.server.place {
-                HostPlace::ThisPc => "Free, but this PC must be on while you play, and your router has to let players in.",
+                HostPlace::ThisPc => "Free and automatic. This computer must be on while you play, and your router has to let players in.",
                 HostPlace::Vps => "Most reliable: always on, its own public address, no router setup at home. Recommended for groups.",
                 HostPlace::LinuxPc => "A spare Linux machine at home (Ubuntu 24.04 / Debian 13). Same router setup as hosting on this PC.",
             };
@@ -1486,67 +1538,68 @@ impl App {
 
     fn server_this_pc(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if steam::is_steam_deck() {
-            warn_card(ui, "The Steam Deck isn't a good server (SteamOS resets system changes and the Deck sleeps). Use a VPS, or a Windows / Linux PC.");
-            return;
+            warn_card(ui, "The Steam Deck makes a poor server: it sleeps, and SteamOS updates can reset things. A VPS or a Windows / Linux PC is better — but it works for a quick session.");
         }
-        if !cfg!(windows) {
-            self.server_linux_pc(ui, ctx);
-            return;
+        if self.server.hub.is_none() && !self.server.checked {
+            self.server.checked = true;
+            self.server_action(ctx, "check");
         }
-        self.router_card(ui, ctx);
-        let w = self.server.wsl.clone();
+        let h = self.server.hub.clone().unwrap_or_default();
         let busy = self.busy();
         let mut action: Option<&'static str> = None;
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("SET UP THE SERVER ON THIS PC").color(ACCENT).strong());
+                ui.label(RichText::new("RUN THE SERVER ON THIS PC").color(ACCENT).strong());
                 if ui.add_enabled(!busy, egui::Button::new("↻  Check")).clicked() {
                     action = Some("check");
                 }
             });
             ui.label(RichText::new(
-                "The official hub runs on Linux, so it runs inside WSL2 — the Linux that's built into Windows. Each step below is one button; \
-                 the two marked (admin) show one Windows permission prompt.",
+                "The helper downloads the official hub source and a portable compiler, builds the hub on this computer and runs it — \
+                 no Linux, no virtual machine, no installer. Everything stays in the helper's own folder.",
             )
             .color(DIM));
-            let Some(w) = w else {
-                ui.label(RichText::new("Press ↻ Check to see what's already set up.").color(DIM));
-                return;
+            let build_detail = match (&h.build_info, h.update_available) {
+                (Some(i), true) => format!("Built ({i}). A newer hub source is out — press Update."),
+                (Some(i), false) => format!("Built ({i}). Press again any time to rebuild from the newest source."),
+                (None, _) => "Downloads about 100 MB once (the compiler) and builds in a few minutes.".to_string(),
             };
-            if step_row(ui, 1, Some(w.installed && w.distro), "Install WSL with Ubuntu 24.04 (admin)", if w.installed && !w.distro {
-                "WSL is installed. If Ubuntu doesn't show up, restart Windows, or press “Open Ubuntu once” and answer its first-start questions (any user name and password)."
+            let build_label = if h.update_available { "⬆ Update" } else if h.built { "Rebuild" } else { "Build" };
+            if step_row(ui, 1, Some(h.built && !h.update_available), "Build the official hub", &build_detail, Some(build_label), !busy) {
+                action = Some(if h.built { "update" } else { "build" });
+            }
+            if cfg!(windows) {
+                if step_row(ui, 2, Some(h.firewall == Some(true)), "Let the hub through Windows Firewall (admin)", &format!("Opens {} for incoming players. One Windows permission prompt.", hub::ports_text(hub::HOME_THREADS)), Some("Open ports"), !busy) {
+                    action = Some("firewall");
+                }
             } else {
-                "Takes a few minutes and may ask you to restart Windows. Then press ↻ Check."
-            }, Some("Install"), !busy)
-            {
-                action = Some("install");
+                step_row(ui, 2, None, "Firewall", &format!("Most desktop Linux has none. If you use ufw: sudo ufw allow {}/udp && sudo ufw allow {}:{}/udp", hub::PORT, hub::PORT + 10, hub::PORT + 9 + hub::HOME_THREADS), None, false);
             }
-            if w.installed && !w.distro && ui.add_enabled(!busy, egui::Button::new("Open Ubuntu once")).clicked() {
-                action = Some("first_start");
-            }
-            if step_row(ui, 2, Some(w.mirrored), "Share Windows' network with Linux (mirrored mode)", "So players can reach the hub through this PC's address. Restarts WSL once. Needs Windows 11 22H2 or newer.", Some("Set up"), !busy) {
-                action = Some("mirrored");
-            }
-            if step_row(ui, 3, Some(w.firewall), "Let the hub through the firewall (admin)", &format!("Opens {} in Windows Firewall and WSL's own firewall.", hub::ports_text(hub::HOME_THREADS)), Some("Open ports"), !busy) {
-                action = Some("firewall");
-            }
-            if step_row(ui, 4, Some(w.built), "Build the official hub", "Downloads the hub's source from the NightCoop project and builds it inside Ubuntu (a few minutes). Press again later to update it.", Some(if w.built { "Rebuild / update" } else { "Build" }), !busy && w.distro) {
-                action = Some("build");
-            }
-            if step_row(ui, 5, Some(w.running), "Run the server", if w.running {
-                "Running. It keeps running after you close the helper, until you press Stop or Windows shuts down."
+            if step_row(ui, 3, Some(h.running), "Run the server", if h.running {
+                "Running. It keeps running after you close the helper, until you press Stop or the computer shuts down."
             } else {
-                "Start it before you host a session. It stops when Windows shuts down — start it again next time."
-            }, Some(if w.running { "Stop" } else { "Start" }), !busy && w.built)
+                "Start it before you host a session."
+            }, Some(if h.running { "Stop" } else { "Start" }), !busy && h.built)
             {
-                action = Some(if w.running { "stop" } else { "start" });
+                action = Some(if h.running { "stop" } else { "start" });
             }
-            if let Some(fp) = &w.fingerprint {
+            ui.horizontal_wrapped(|ui| {
+                let mut auto = h.autostart;
+                if ui.add_enabled(h.built && !busy, egui::Checkbox::new(&mut auto, "Start the server when this computer starts")).changed() {
+                    action = Some(if auto { "autostart_on" } else { "autostart_off" });
+                }
+                let mut upd = self.settings.hub_auto_update;
+                if ui.checkbox(&mut upd, "Update the server automatically").on_hover_text("When the helper checks for updates and the official hub source changed, it rebuilds and restarts the server").changed() {
+                    self.settings.hub_auto_update = upd;
+                    self.settings.save();
+                }
+            });
+            if let Some(fp) = &h.fingerprint {
                 ui.label(RichText::new(format!("Your server's key fingerprint: {fp}")).color(CYAN));
-                ui.label(RichText::new("The key is backed up in the helper's data folder, so the fingerprint stays the same after a reinstall.").color(DIM).small());
+                ui.label(RichText::new("The key is backed up in the helper's data folder, so the fingerprint stays the same after a rebuild.").color(DIM).small());
             }
-            let log = config::sub("logs").join("hub.log");
-            if w.built && log.is_file() {
+            let log = hub::log_file();
+            if h.built && log.is_file() {
                 ui.collapsing("Server log", |ui| {
                     for l in hub::log_tail(&log, 12) {
                         ui.label(RichText::new(l).monospace().size(11.0));
@@ -1554,72 +1607,54 @@ impl App {
                 });
             }
         });
+        self.router_card(ui, ctx);
         if let Some(a) = action {
             self.server_action(ctx, a);
         }
     }
 
-    #[cfg(windows)]
     fn server_action(&mut self, ctx: &egui::Context, action: &'static str) {
-        use hub::wsl;
-        let name = computer_name();
+        let name = hub::computer_name();
         let title = match action {
-            "install" => "Installing WSL and Ubuntu",
-            "mirrored" => "Setting up WSL networking",
+            "build" => "Building the server",
+            "update" => "Updating the server",
             "firewall" => "Opening the firewall",
-            "build" => "Building the hub",
             "start" => "Starting the server",
             "stop" => "Stopping the server",
-            "first_start" => {
-                if let Err(e) = wsl::open_first_start() {
-                    self.banner = Some((false, format!("{e:#}")));
-                }
-                return;
-            }
+            "autostart_on" | "autostart_off" => "Changing server autostart",
             _ => "Checking the server setup",
         };
         self.spawn(ctx, title, move |rep, _, _| {
             match action {
-                "install" => {
-                    rep.progress(None, "Installing WSL and Ubuntu (accept the Windows prompt)…");
-                    wsl::install()?;
-                    rep.log("WSL setup finished. If Windows asks for a restart, restart and come back to this page.");
-                }
-                "mirrored" => {
-                    wsl::set_mirrored()?;
-                    rep.log("WSL now shares Windows' network (mirrored mode).");
+                "build" | "update" => {
+                    let info = hub::update(rep, &name)?;
+                    rep.log(format!("Hub built: {info}."));
                 }
                 "firewall" => {
-                    rep.progress(None, "Opening the ports (accept the Windows prompt)…");
-                    wsl::open_firewall(hub::HOME_THREADS)?;
-                    rep.log("Firewall rules added for the hub's ports.");
-                }
-                "build" => {
-                    rep.progress(None, "Building the hub inside Ubuntu (a few minutes)…");
-                    let out = wsl::build_hub(&name)?;
-                    if let Some(line) = out.lines().find(|l| l.starts_with("Hub source:")) {
-                        rep.log(line.to_string());
+                    #[cfg(windows)]
+                    {
+                        rep.progress(None, "Opening the ports (accept the Windows prompt)…");
+                        hub::firewall::open(hub::HOME_THREADS)?;
+                        rep.log("Firewall rule added for the hub's ports.");
                     }
-                    rep.log("Hub built.");
                 }
                 "start" => {
                     rep.progress(None, "Starting the server…");
-                    wsl::start(&name)?;
+                    hub::start(&name)?;
                     rep.log("Server running.");
                 }
                 "stop" => {
-                    wsl::stop()?;
+                    hub::stop()?;
                     rep.log("Server stopped.");
                 }
+                "autostart_on" => hub::set_autostart(true)?,
+                "autostart_off" => hub::set_autostart(false)?,
                 _ => {}
             }
             rep.progress(None, "Checking the setup…");
-            Ok(Extra::Wsl(wsl_status()))
+            Ok(Extra::Hub(hub_status()))
         });
     }
-
-    #[cfg(not(windows))]
-    fn server_action(&mut self, _ctx: &egui::Context, _action: &'static str) {}
 
     fn server_vps(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
@@ -1666,7 +1701,7 @@ impl App {
         self.router_card(ui, ctx);
         card(ui, |ui| {
             ui.label(RichText::new("SET UP A LINUX PC").color(ACCENT).strong());
-            ui.label("On an Ubuntu 24.04 / Debian 13 computer, open a terminal and run:");
+            ui.label("Easiest: copy this helper to that computer and use “This computer” there. Or, on an Ubuntu 24.04 / Debian 13 computer, run this in a terminal to install it as a system service:");
             let cmd = hub::setup_command(false);
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(&cmd).monospace().color(CYAN));
@@ -1695,12 +1730,18 @@ impl App {
                 if ui.button("📋  Copy diagnostics").clicked() {
                     ui.ctx().copy_text(diag.clone());
                 }
+                if ui.button("💬  Ask the AI helper").on_hover_text("Your own local AI looks at this setup and explains what to do").clicked() {
+                    if self.ai.messages.is_empty() && self.ai.input.is_empty() {
+                        self.ai.input = "Something isn't working. Look at my setup: what's wrong and what should I do?".into();
+                    }
+                    self.page = Page::Ai;
+                }
                 if let Some(g) = &self.status.game.clone() {
                     if ui.button("Open game folder").clicked() {
                         util::open_path(&g.dir);
                     }
                     if ui.button("Open logs").clicked() {
-                        util::open_path(g.red4ext_dir().join("logs"));
+                        util::open_path(g.active_red4ext_dir().join("logs"));
                     }
                     if g.uses_proton()
                         && ui
@@ -1794,6 +1835,751 @@ impl App {
             ui.label("• Saves made with Phantom Liberty won't load in a session hosted without it.");
             ui.label("• NightCoop officially targets Windows; Steam Deck runs it through Proton. If something only breaks on the Deck, mention that in bug reports.");
         });
+    }
+
+    // ---------- AI helper ----------
+
+    fn poll_ai(&mut self) {
+        if let Some((rx, _)) = &self.ai.stream {
+            let mut finished = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(ai::Event::Delta(t)) => match self.ai.messages.last_mut() {
+                        Some(m) if m.role == "assistant" => m.content.push_str(&t),
+                        _ if t.trim().is_empty() => {}
+                        _ => self.ai.messages.push(ai::Message { role: "assistant", content: t }),
+                    },
+                    Ok(ai::Event::Tools(calls)) => {
+                        for call in calls {
+                            let state = match ai::risk(&call.name) {
+                                ai::Risk::Look => ActState::Ready,
+                                ai::Risk::Change if self.settings.ai_auto_approve => ActState::Ready,
+                                _ => ActState::Ask,
+                            };
+                            let label = self.ai_label(&call);
+                            self.ai.actions.push(AiAction { call, label, state });
+                        }
+                    }
+                    Ok(ai::Event::Notice(n)) => self.ai.notice = Some(n),
+                    Ok(ai::Event::Done) | Err(TryRecvError::Disconnected) => {
+                        finished = true;
+                        break;
+                    }
+                    Ok(ai::Event::Error(e)) => {
+                        self.ai.error = Some(e);
+                        finished = true;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                }
+            }
+            if finished {
+                self.ai.stream = None;
+                self.ai.results = None;
+                self.ai.actions.clear();
+                self.ai.messages.retain(|m| !m.content.trim().is_empty());
+            }
+        }
+        if let Some(rx) = &self.ai.probe {
+            match rx.try_recv() {
+                Ok(Ok((url, models))) => {
+                    self.ai.probe = None;
+                    if url != self.settings.ai_url {
+                        self.settings.ai_url = url;
+                        self.settings.save();
+                    }
+                    self.ai.connection = Some(Ok(if models.is_empty() {
+                        "Connected, but no model is downloaded yet (e.g. ollama pull llama3.1:8b).".into()
+                    } else {
+                        format!("Connected · {} model(s)", models.len())
+                    }));
+                    self.ai.models = models;
+                }
+                Ok(Err(e)) => {
+                    self.ai.probe = None;
+                    self.ai.connection = Some(Err(e));
+                }
+                Err(TryRecvError::Disconnected) => self.ai.probe = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    /// Checks the AI server in the background; `find` also tries the usual local addresses.
+    fn ai_probe(&mut self, ctx: &egui::Context, find: bool) {
+        if self.ai.probe.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let (url, key) = (self.settings.ai_url.trim().to_string(), self.settings.ai_key.clone());
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let mut result = ai::list_models(&url, &key).map(|m| (url.clone(), m));
+            if find && result.is_err() {
+                result = match ai::find_local() {
+                    Some((_, found, models)) => Ok((found.to_string(), models)),
+                    None => Err("No AI found on this computer. Install Ollama or LM Studio (steps above), or enter the address of the computer running it.".into()),
+                };
+            }
+            let _ = tx.send(result);
+            c.request_repaint();
+        });
+        self.ai.probe = Some(rx);
+        self.ai.connection = None;
+    }
+
+    fn ai_send(&mut self, ctx: &egui::Context) {
+        let question = self.ai.input.trim().to_string();
+        if question.is_empty() || self.ai.stream.is_some() {
+            return;
+        }
+        self.ai.input.clear();
+        self.ai.error = None;
+        self.ai.messages.push(ai::Message { role: "user", content: question });
+        let history = self.ai.messages.clone();
+        let diagnostics = self.settings.ai_share_status.then(|| self.status.diagnostics(&self.state));
+        // So the AI knows about updates without having to ask for them first.
+        if self.remote.nightcoop.is_none() && !self.busy() {
+            self.check_updates(ctx);
+        }
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (url, key, model) = (self.settings.ai_url.clone(), self.settings.ai_key.clone(), self.settings.ai_model.clone());
+        let (c, s) = (ctx.clone(), stop.clone());
+        let (results_tx, results_rx) = mpsc::channel();
+        self.ai.results = Some(results_tx);
+        self.ai.notice = None;
+        std::thread::spawn(move || ai::chat(url, key, model, diagnostics, history, Some(results_rx), s, tx, move || c.request_repaint()));
+        self.ai.stream = Some((rx, stop));
+    }
+
+    fn ai_page(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.heading(RichText::new("AI helper").size(28.0).strong());
+        ui.label(RichText::new(
+            "Ask anything about setting up NightCoop, errors, or playing together. It runs on an AI you host yourself \
+             (Ollama or LM Studio): free, private, and it can see this helper's status checks to pinpoint problems.",
+        )
+        .color(DIM));
+        ui.add_space(6.0);
+        if !self.ai.probed {
+            self.ai.probed = true;
+            self.ai_probe(&ctx, false);
+        }
+        // NCH_AI_ASK="question" sends a question as soon as the AI answers (for testing).
+        if let Ok(q) = std::env::var("NCH_AI_ASK") {
+            if !self.ai.test_asked && matches!(self.ai.connection, Some(Ok(_))) && !q.is_empty() {
+                self.ai.test_asked = true;
+                self.ai.input = q;
+                self.ai_send(&ctx);
+            }
+        }
+        let connected = matches!(self.ai.connection, Some(Ok(_)));
+
+        egui::CollapsingHeader::new(RichText::new("SET UP YOUR AI").color(ACCENT).strong())
+            .id_salt("ai-setup")
+            .default_open(!self.settings_has_ai())
+            .show(ui, |ui| {
+                ui.label(RichText::new("On a Windows or Linux PC").strong());
+                ui.label("1. Install Ollama (ollama.com) or LM Studio (lmstudio.ai).");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("2. Download a model. Ollama, in a terminal:");
+                    ui.label(RichText::new("ollama pull llama3.1:8b").monospace().color(CYAN));
+                    if ui.small_button("📋").clicked() {
+                        ui.ctx().copy_text("ollama pull llama3.1:8b".into());
+                    }
+                });
+                ui.label(RichText::new("qwen2.5:7b works well too; on a weak laptop try llama3.2:3b. In LM Studio: download a model, then Developer → Start server.").color(DIM));
+                ui.label("3. Press “Find my AI”.");
+                ui.label(RichText::new("On a Steam Deck").strong());
+                ui.label(RichText::new(
+                    "Easiest: use the AI on your PC. On the PC, let other devices in — LM Studio: Developer → “Serve on local network”; \
+                     Ollama: set the environment variable OLLAMA_HOST=0.0.0.0 and restart it. Then enter the PC's address here, \
+                     like http://192.168.1.20:11434/v1 (LM Studio uses port 1234). The Deck can also run LM Studio's AppImage itself with a small (3B) model.",
+                )
+                .color(DIM));
+                ui.add_space(4.0);
+                let mut changed = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Address:");
+                    changed |= ui.add(egui::TextEdit::singleline(&mut self.settings.ai_url).desired_width(300.0).hint_text(ai::DEFAULT_URL)).lost_focus();
+                    let probing = self.ai.probe.is_some();
+                    if ui.add_enabled(!probing, egui::Button::new("🔎  Find my AI")).on_hover_text("Tries this address, then Ollama, LM Studio, llama.cpp and Jan on this computer").clicked() {
+                        self.settings.save();
+                        self.ai_probe(&ctx, true);
+                    }
+                    if ui.add_enabled(!probing, egui::Button::new("Test")).clicked() {
+                        self.settings.save();
+                        self.ai_probe(&ctx, false);
+                    }
+                    if probing {
+                        ui.spinner();
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Model:");
+                    let shown = if self.settings.ai_model.is_empty() { "automatic (first listed)".to_string() } else { self.settings.ai_model.clone() };
+                    egui::ComboBox::from_id_salt("ai-model").selected_text(shown).width(260.0).show_ui(ui, |ui| {
+                        changed |= ui.selectable_value(&mut self.settings.ai_model, String::new(), "automatic (first listed)").changed();
+                        for m in self.ai.models.clone() {
+                            changed |= ui.selectable_value(&mut self.settings.ai_model, m.clone(), m).changed();
+                        }
+                    });
+                    ui.label("API key:");
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(&mut self.settings.ai_key).password(true).desired_width(140.0).hint_text("not needed"))
+                        .on_hover_text("Only for servers that ask for one. Ollama and LM Studio don't.")
+                        .lost_focus();
+                });
+                changed |= ui
+                    .checkbox(&mut self.settings.ai_share_status, "Let the AI see my status checks (versions, Proton, launch option, log summary)")
+                    .on_hover_text("The same text as Troubleshoot → Diagnostics; account names and your home folder are hidden")
+                    .changed();
+                if changed {
+                    self.settings.save();
+                }
+                let url = self.settings.ai_url.trim();
+                if !url.is_empty() && !url.contains("localhost") && !url.contains("127.0.0.1") {
+                    ui.label(RichText::new("Questions (and your status checks, if allowed) go to this address — make sure it's a computer you trust.").color(DIM).small());
+                }
+            });
+        match &self.ai.connection {
+            Some(Ok(t)) => {
+                ui.label(RichText::new(format!("✔ {t}")).color(OK));
+            }
+            Some(Err(e)) => {
+                ui.label(RichText::new(format!("✖ {e}")).color(WARN));
+            }
+            None => {}
+        }
+        ui.add_space(4.0);
+
+        card(ui, |ui| {
+            let streaming = self.ai.stream.is_some();
+            if self.ai.messages.is_empty() {
+                ui.label(RichText::new("WHAT YOUR AI CAN DO").color(ACCENT).strong());
+                ui.label(RichText::new(
+                    "It knows how NightCoop and this helper work, and it can use the helper for you: check your setup and logs, \
+                     install or update everything, switch builds to match your partner, turn mods off/on, back up saves, fix the \
+                     Steam Deck's Visual C++ runtime and launch option, test your connection, and build, start and update your own server. \
+                     Anything that changes something asks you first (unless you allow it below); removing mods or restoring saves always asks.",
+                )
+                .color(DIM));
+                ui.label(RichText::new(if connected { "Try one of these, or type your own question below:" } else { "Set up your AI above, then try one of these or type your own question:" }).color(DIM));
+                ui.horizontal_wrapped(|ui| {
+                    for q in [
+                        "There's no Co-op menu in the game. What's wrong?",
+                        "Explain my status checks.",
+                        "How do my partner and I join each other?",
+                        "RED4ext error 998 on my Steam Deck",
+                        "Should I host my own server?",
+                    ] {
+                        if ui.add_enabled(!streaming, egui::Button::new(q)).clicked() {
+                            self.ai.input = q.into();
+                            self.ai_send(&ctx);
+                        }
+                    }
+                });
+            }
+            let count = self.ai.messages.len();
+            for (i, m) in self.ai.messages.iter().enumerate() {
+                ui.add_space(4.0);
+                if m.role == "tool" {
+                    ui.label(RichText::new(format!("🔧 {}", m.content)).color(DIM).small());
+                } else if m.role == "user" {
+                    ui.label(RichText::new("You").color(CYAN).strong());
+                    ui.label(&m.content);
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("AI").color(ACCENT).strong());
+                        if streaming && i + 1 == count {
+                            ui.spinner();
+                        } else if ui.small_button("📋 Copy").clicked() {
+                            ui.ctx().copy_text(m.content.clone());
+                        }
+                    });
+                    markdown(ui, &m.content);
+                }
+            }
+            let mut decide: Option<(usize, bool)> = None;
+            for (i, a) in self.ai.actions.iter().enumerate() {
+                match &a.state {
+                    ActState::Ask => {
+                        egui::Frame::new().stroke(egui::Stroke::new(1.0, ACCENT)).corner_radius(6).inner_margin(8).show(ui, |ui| {
+                            ui.label(RichText::new("The AI wants to:").color(DIM).small());
+                            ui.label(RichText::new(&a.label).strong());
+                            ui.horizontal(|ui| {
+                                if ui.add(egui::Button::new(RichText::new("✔ Allow").strong().color(Color32::BLACK)).fill(ACCENT)).clicked() {
+                                    decide = Some((i, true));
+                                }
+                                if ui.button("✖ Decline").clicked() {
+                                    decide = Some((i, false));
+                                }
+                            });
+                        });
+                    }
+                    ActState::Ready | ActState::Running => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(RichText::new(&a.label).color(DIM));
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            if let Some((i, yes)) = decide {
+                self.ai.actions[i].state = if yes { ActState::Ready } else { ActState::Declined };
+            }
+            if let Some(n) = &self.ai.notice {
+                ui.label(RichText::new(format!("ℹ {n}")).color(CYAN).small());
+            }
+            if let Some(e) = &self.ai.error {
+                ui.label(RichText::new(format!("⚠ {e}")).color(BAD));
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let input = ui.add(
+                    egui::TextEdit::singleline(&mut self.ai.input)
+                        .desired_width((ui.available_width() - 190.0).max(200.0))
+                        .hint_text("Ask a question and press Enter"),
+                );
+                let enter = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if streaming {
+                    if ui.button("■  Stop").clicked() {
+                        if let Some((_, stop)) = &self.ai.stream {
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                } else {
+                    let has_text = !self.ai.input.trim().is_empty();
+                    let send = ui.add_enabled(has_text, egui::Button::new(RichText::new("Send").strong().color(Color32::BLACK)).fill(ACCENT)).clicked();
+                    if (send || enter) && has_text {
+                        self.ai_send(&ctx);
+                        input.request_focus();
+                    }
+                    if !self.ai.messages.is_empty() && ui.button("Clear").clicked() {
+                        self.ai.messages.clear();
+                        self.ai.error = None;
+                        self.ai.notice = None;
+                    }
+                }
+            });
+            if ui
+                .checkbox(&mut self.settings.ai_auto_approve, "Let the AI act without asking (uninstalling and restoring saves still ask)")
+                .changed()
+            {
+                self.settings.save();
+            }
+            ui.label(RichText::new("AI answers can be wrong. Every action it takes shows up here and in the activity log on Home.").color(DIM).small());
+        });
+    }
+
+    /// The player changed the AI address or picked a model at some point.
+    fn settings_has_ai(&self) -> bool {
+        self.settings.ai_url.trim() != ai::DEFAULT_URL || !self.settings.ai_model.is_empty()
+    }
+
+    // ---------- AI agent: the helper's actions as tools ----------
+
+    /// Runs the AI's approved tool calls one at a time and hands the results back.
+    fn ai_drive(&mut self, ctx: &egui::Context) {
+        if self.ai.actions.is_empty() {
+            return;
+        }
+        for i in 0..self.ai.actions.len() {
+            match self.ai.actions[i].state {
+                ActState::Done(_) | ActState::Declined => continue,
+                ActState::Ask | ActState::Running => return,
+                ActState::Ready => {
+                    if !self.busy() {
+                        self.ai_run(ctx, i);
+                    }
+                    return;
+                }
+            }
+        }
+        let mut results = Vec::new();
+        for a in self.ai.actions.drain(..) {
+            let (mark, text) = match a.state {
+                ActState::Done(r) => (if r.starts_with("FAILED") { "⚠" } else { "✔" }, r),
+                _ => ("✖", "The player declined this. Don't retry it; ask what they'd like instead.".to_string()),
+            };
+            self.ai.messages.push(ai::Message { role: "tool", content: format!("{mark}  {}", a.label) });
+            results.push((a.call.id, ai::shorten(&text, 3000)));
+        }
+        if let Some(tx) = &self.ai.results {
+            let _ = tx.send(results);
+        }
+    }
+
+    fn ai_run(&mut self, ctx: &egui::Context, i: usize) {
+        let call = self.ai.actions[i].call.clone();
+        let log_start = self.log.len();
+        self.banner = None;
+        let instant = self.ai_tool(ctx, &call);
+        let state = match instant {
+            Some(r) => ActState::Done(r),
+            None if self.busy() => {
+                self.ai.job = Some((i, log_start));
+                ActState::Running
+            }
+            None => ActState::Done(match &self.banner {
+                Some((ok, msg)) => format!("{}{msg}", if *ok { "" } else { "FAILED: " }),
+                None => "Nothing happened — check get_status (is the game found and installed?).".into(),
+            }),
+        };
+        self.ai.actions[i].state = state;
+    }
+
+    /// A finished job that the AI started: its log and outcome become the tool's result.
+    fn ai_job_finished(&mut self) {
+        let Some((i, start)) = self.ai.job.take() else { return };
+        let lines = &self.log[start.min(self.log.len())..];
+        let failed = lines.iter().any(|l| l.starts_with("ERROR"));
+        let name = self.ai.actions.get(i).map(|a| a.call.name.clone()).unwrap_or_default();
+        let mut r = format!("{}\n{}", if failed { "FAILED" } else { "Finished" }, lines.join("\n"));
+        r.push_str(&self.ai_followup(&name));
+        if let Some(a) = self.ai.actions.get_mut(i) {
+            a.state = ActState::Done(r);
+        }
+    }
+
+    /// Fresh facts after a job, so the AI sees what changed.
+    fn ai_followup(&self, name: &str) -> String {
+        match name {
+            "check_for_updates" => format!("\n{}", self.update_summary()),
+            "check_connection" => self.connection.as_ref().map(|r| format!("\nResult: {} (server found: {}, UDP works: {})", r.summary(), r.hub_resolves, r.udp_works)).unwrap_or_default(),
+            "check_router" | "open_router_ports" => self.server.router.as_ref().map(router_summary).unwrap_or_default(),
+            n if n.contains("server") => self.server.hub.as_ref().map(hub_summary).unwrap_or_default(),
+            _ => format!("\nNow: {} · mods {} · ready to play: {}", self.share_text(), if self.status.mods_off { "OFF" } else { "on" }, self.status.ready()),
+        }
+    }
+
+    /// Carries out one tool call. `Some` is an immediate result; `None` means a job was started
+    /// (or nothing happened, which the banner explains).
+    fn ai_tool(&mut self, ctx: &egui::Context, call: &ai::ToolCall) -> Option<String> {
+        let game = self.status.game.clone();
+        let no_game = || Some("FAILED: Cyberpunk 2077 wasn't found. The player can set the game folder in Settings.".to_string());
+        match call.name.as_str() {
+            "get_status" => Some(format!(
+                "{}\n{}\nMods off: {} · Game running: {} · Steam running: {} · Gaming Mode: {} · Ready to play: {}",
+                self.status.diagnostics(&self.state),
+                self.update_summary(),
+                self.status.mods_off,
+                self.status.game_running,
+                self.status.steam_running,
+                steam::in_gaming_mode(),
+                self.status.ready()
+            )),
+            "read_logs" => {
+                let mut out = String::from("RED4ext log:\n");
+                out.push_str(&self.status.log_lines.iter().rev().take(40).rev().cloned().collect::<Vec<_>>().join("\n"));
+                if let Some(g) = &game {
+                    let newest = std::fs::read_dir(g.active_plugin_dir().join("logs"))
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .filter(|e| e.path().is_file())
+                        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
+                    if let Some(f) = newest {
+                        out.push_str(&format!("\n\nNightCoop log {}:\n", f.file_name().to_string_lossy()));
+                        out.push_str(&hub::log_tail(&f.path(), 40).join("\n"));
+                    }
+                }
+                Some(game::redact_home(&out))
+            }
+            "check_for_updates" => {
+                self.check_updates(ctx);
+                None
+            }
+            "list_nightcoop_builds" => Some(match &self.remote.nightcoop {
+                Some(Ok(m)) => {
+                    let mut list: Vec<String> = m
+                        .releases
+                        .iter()
+                        .map(|r| {
+                            format!(
+                                "{} ({}{}) protocol {} · game {} · {}",
+                                r.version,
+                                if r.is_stable() { "stable" } else { "beta" },
+                                if r.is_yanked() { ", withdrawn" } else { "" },
+                                r.protocol_str().unwrap_or_else(|| "?".into()),
+                                r.game.join("/"),
+                                r.date.clone().unwrap_or_default()
+                            )
+                        })
+                        .collect();
+                    list.push(format!("Installed: {}", self.status.nightcoop_version.clone().unwrap_or_else(|| "none".into())));
+                    list.join("\n")
+                }
+                Some(Err(e)) => format!("FAILED: couldn't load the list: {e}"),
+                None => "Not loaded yet: call check_for_updates first.".into(),
+            }),
+            "list_save_backups" => Some(if self.backups.is_empty() {
+                "No backups yet.".into()
+            } else {
+                self.backups.iter().map(|(p, size)| format!("{} ({})", p.file_stem().unwrap_or_default().to_string_lossy(), util::human_size(*size))).collect::<Vec<_>>().join("\n")
+            }),
+            "check_connection" => {
+                self.spawn(ctx, "Checking the connection", |rep, _, _| {
+                    rep.progress(None, "Checking the connection…");
+                    Ok(Extra::Connection(net::connection_check()))
+                });
+                None
+            }
+            "compare_with_partner" => {
+                let text = call.arg("text");
+                let rows = compare_versions(&self.share_text(), &text);
+                let mut out: Vec<String> = rows
+                    .iter()
+                    .map(|(k, mine, theirs, same)| format!("{k}: mine {} · theirs {} · {}", if mine.is_empty() { "?" } else { mine }, theirs.as_deref().unwrap_or("?"), if theirs.is_none() { "unknown" } else if *same { "same" } else { "DIFFERENT" }))
+                    .collect();
+                if let Some(inv) = invite::find(&text) {
+                    out.push(format!("Invite found: {} (code {})", inv.line(), inv.code));
+                }
+                Some(out.join("\n"))
+            }
+            "open_page" => {
+                let want = call.arg("page").to_ascii_lowercase();
+                let page = Page::ALL.into_iter().find(|p| {
+                    let l = p.label().to_ascii_lowercase();
+                    !want.is_empty() && (l.contains(&want) || (want == "server" && *p == Page::Server) || (want == "versions" && *p == Page::Versions))
+                });
+                Some(match page {
+                    Some(p) => {
+                        self.page = p;
+                        format!("Showing {}.", p.label().trim_start_matches(|c: char| !c.is_ascii_alphabetic()))
+                    }
+                    None => "Unknown page.".into(),
+                })
+            }
+            "get_server_status" => {
+                self.server_action(ctx, "check");
+                None
+            }
+            "check_router" | "open_router_ports" => {
+                let open = (call.name == "open_router_ports").then(|| call.flag("open"));
+                self.spawn(ctx, "Checking your network", move |rep, _, _| {
+                    rep.progress(None, "Asking your router…");
+                    Ok(Extra::Router(router_check(open)))
+                });
+                None
+            }
+            "install_or_update_everything" => {
+                if game.is_none() {
+                    return no_game();
+                }
+                self.start_setup(ctx, call.flag("restart_steam") && !steam::in_gaming_mode());
+                None
+            }
+            "install_nightcoop_version" => {
+                let v = call.arg("version").trim_start_matches(['v', 'V']).to_string();
+                match &self.remote.nightcoop {
+                    Some(Ok(m)) if m.find(&v).is_some() => {
+                        self.run_confirm(ctx, Confirm::InstallNcVersion(v), 1);
+                        None
+                    }
+                    Some(Ok(_)) => Some(format!("FAILED: there is no build {v}. Call list_nightcoop_builds.")),
+                    _ => Some("FAILED: the build list isn't loaded: call check_for_updates first.".into()),
+                }
+            }
+            "mods_off" | "mods_on" => {
+                let Some(g) = game else { return no_game() };
+                if call.name == "mods_on" {
+                    if !self.status.mods_off {
+                        return Some("Mods are already on.".into());
+                    }
+                    self.spawn(ctx, "Turning mods on", move |rep, _, _| ops::mods_on(&g, rep).map(|_| Extra::None));
+                } else {
+                    if self.status.mods_off {
+                        return Some("Mods are already off.".into());
+                    }
+                    let extras = self.state.nightcoop_extra_files.clone();
+                    self.spawn(ctx, "Turning mods off", move |rep, _, _| ops::mods_off(&g, &extras, rep).map(|_| Extra::None));
+                }
+                None
+            }
+            "backup_saves" => {
+                let Some(g) = game else { return no_game() };
+                self.spawn(ctx, "Backing up saves", move |rep, state, settings| ops::backup_saves(&g, settings, state, rep, "", false).map(|_| Extra::None));
+                None
+            }
+            "install_vc_runtime" => {
+                let Some(g) = game else { return no_game() };
+                if !g.uses_proton() {
+                    return Some("Not needed: the game doesn't run through Proton here.".into());
+                }
+                self.spawn(ctx, "Installing the Visual C++ runtime", move |rep, _, _| ops::install_vc_runtime(&g, rep).map(|_| Extra::None));
+                None
+            }
+            "set_steam_launch_option" => {
+                let Some(g) = game else { return no_game() };
+                if !g.uses_proton() {
+                    return Some("Not needed: launch options are only for Proton (Steam Deck/Linux).".into());
+                }
+                if steam::in_gaming_mode() {
+                    return Some("FAILED: Steam can't be restarted in Gaming Mode. The player can switch to Desktop Mode, or paste the line in Cyberpunk → Properties → Launch Options.".into());
+                }
+                self.run_confirm(ctx, Confirm::LaunchOption { enable: call.flag("enable") }, 1);
+                None
+            }
+            "use_bundled_red4ext" => {
+                let Some(g) = game else { return no_game() };
+                self.use_bundled_red4ext(ctx, &g);
+                None
+            }
+            "set_update_channel" => {
+                let beta = call.arg("channel").eq_ignore_ascii_case("beta");
+                self.settings.channel = if beta { Channel::Beta } else { Channel::Stable };
+                self.settings.save();
+                Some(format!("Update channel: {}.", if beta { "beta" } else { "stable" }))
+            }
+            "launch_game" => {
+                if self.status.game_running {
+                    return Some("The game is already running.".into());
+                }
+                if game.as_ref().map(|g| g.steam.is_none()).unwrap_or(true) {
+                    return Some("FAILED: only the Steam version can be started from here.".into());
+                }
+                steam::launch_game();
+                Some("Cyberpunk 2077 is starting through Steam.".into())
+            }
+            "add_helper_to_steam" => {
+                if steam::in_gaming_mode() {
+                    return Some("FAILED: needs Desktop Mode (Steam restarts).".into());
+                }
+                self.run_confirm(ctx, Confirm::AddToSteam, 1);
+                None
+            }
+            "update_helper" => match self.remote.helper.clone() {
+                Some(Ok(Some(u))) => {
+                    self.spawn(ctx, "Updating helper", move |rep, _, _| {
+                        selfupdate::apply(&u, rep)?;
+                        Ok(Extra::HelperUpdated)
+                    });
+                    None
+                }
+                Some(Ok(None)) => Some("The helper is already up to date.".into()),
+                _ => Some("Unknown: call check_for_updates first.".into()),
+            },
+            "build_server" => {
+                self.server_action(ctx, "update");
+                None
+            }
+            "start_server" | "stop_server" => {
+                self.server_action(ctx, if call.name == "start_server" { "start" } else { "stop" });
+                None
+            }
+            "open_server_firewall" => {
+                if !cfg!(windows) {
+                    return Some("Only Windows needs this; Linux desktops usually have no firewall (ufw users: allow the UDP ports).".into());
+                }
+                self.server_action(ctx, "firewall");
+                None
+            }
+            "set_server_autostart" => {
+                self.server_action(ctx, if call.flag("on") { "autostart_on" } else { "autostart_off" });
+                None
+            }
+            "use_server_in_game" => {
+                let Some(addr) = hub::parse_address(&call.arg("address")) else {
+                    return Some("FAILED: that isn't address#FINGERPRINT.".into());
+                };
+                let Some(g) = game else { return no_game() };
+                self.server.address = addr.clone();
+                Some(match hub::use_in_game(&g, &addr) {
+                    Ok(()) => format!("The game will use {addr} the next time it starts."),
+                    Err(e) => format!("FAILED: {e:#}"),
+                })
+            }
+            "uninstall_nightcoop" => {
+                self.run_confirm(ctx, Confirm::UninstallNightCoop, 1);
+                None
+            }
+            "remove_everything" => {
+                self.run_confirm(ctx, Confirm::RemoveAll, 1);
+                None
+            }
+            "restore_save_backup" => {
+                let name = call.arg("name");
+                match self.backups.iter().find(|(p, _)| !name.is_empty() && p.file_name().unwrap_or_default().to_string_lossy().contains(name.as_str())) {
+                    Some((p, _)) => {
+                        let p = p.clone();
+                        self.run_confirm(ctx, Confirm::RestoreSaves(p), 1);
+                        None
+                    }
+                    None => Some("FAILED: no backup by that name. Call list_save_backups.".into()),
+                }
+            }
+            other => Some(format!("FAILED: there is no tool called {other}.")),
+        }
+    }
+
+    /// What's available online compared with what's installed.
+    fn update_summary(&self) -> String {
+        let mut out = Vec::new();
+        match (&self.remote.nightcoop, self.nc_latest()) {
+            (None, _) => out.push("Updates: not checked yet (call check_for_updates).".to_string()),
+            (Some(Err(e)), _) => out.push(format!("NightCoop list: couldn't load ({e})")),
+            (Some(Ok(_)), Some(l)) => out.push(format!(
+                "NightCoop latest ({:?} channel): {}{}",
+                self.settings.channel,
+                l.version,
+                if self.nc_update_available() { " — UPDATE AVAILABLE" } else { "" }
+            )),
+            (Some(Ok(_)), None) => out.push("NightCoop: no build listed".into()),
+        }
+        if let Some(l) = self.r4_latest() {
+            out.push(format!("RED4ext on GitHub: {} (the bundled one is recommended)", l.version()));
+        }
+        match &self.remote.helper {
+            Some(Ok(Some(u))) => out.push(format!("Helper update available: {}", u.version)),
+            Some(Ok(None)) => out.push("Helper: up to date".into()),
+            _ => {}
+        }
+        if let Some(Ok(c)) = &self.remote.hub {
+            out.push(if hub::update_available(c) { "Own server (hub): UPDATE AVAILABLE".into() } else { "Own server (hub): up to date".into() });
+        }
+        out.join("\n")
+    }
+
+    /// The approval card text: what the AI wants to do, in the player's words.
+    fn ai_label(&self, call: &ai::ToolCall) -> String {
+        match call.name.as_str() {
+            "get_status" => "Looked at your setup".into(),
+            "read_logs" => "Read the RED4ext and NightCoop logs".into(),
+            "check_for_updates" => "Checked for updates".into(),
+            "list_nightcoop_builds" => "Looked at the NightCoop builds".into(),
+            "list_save_backups" => "Looked at your save backups".into(),
+            "check_connection" => "Tested your connection".into(),
+            "compare_with_partner" => "Compared your versions with your partner's".into(),
+            "open_page" => format!("Opened the {} page", call.arg("page")),
+            "get_server_status" => "Checked your server".into(),
+            "check_router" => "Asked your router".into(),
+            "install_or_update_everything" => "Install / update everything (NightCoop, RED4ext, Visual C++ runtime, launch option)".into(),
+            "install_nightcoop_version" => format!("Install NightCoop {}", call.arg("version")),
+            "mods_off" => "Turn mods off".into(),
+            "mods_on" => "Turn mods back on".into(),
+            "backup_saves" => "Back up your saves".into(),
+            "install_vc_runtime" => "Install the Visual C++ runtime into the game's Proton files".into(),
+            "set_steam_launch_option" => format!("{} the Steam launch option (Steam closes and restarts)", if call.flag("enable") { "Set" } else { "Remove" }),
+            "use_bundled_red4ext" => "Switch to the RED4ext bundled with NightCoop".into(),
+            "set_update_channel" => format!("Switch the update channel to {}", call.arg("channel")),
+            "launch_game" => "Start Cyberpunk 2077".into(),
+            "add_helper_to_steam" => "Add this helper to your Steam library (Steam restarts)".into(),
+            "update_helper" => "Update this helper app".into(),
+            "build_server" => "Build / update your own server on this computer".into(),
+            "start_server" => "Start your server".into(),
+            "stop_server" => "Stop your server".into(),
+            "open_server_firewall" => "Open the server's ports in Windows Firewall (admin prompt)".into(),
+            "open_router_ports" => format!("{} the server's ports on your router", if call.flag("open") { "Forward" } else { "Close" }),
+            "set_server_autostart" => format!("{} starting the server with this computer", if call.flag("on") { "Turn on" } else { "Turn off" }),
+            "use_server_in_game" => format!("Use the server {} in your game", call.arg("address")),
+            "uninstall_nightcoop" => "Uninstall NightCoop (saves stay)".into(),
+            "restore_save_backup" => format!("Replace your saves with the backup {} (current saves are backed up first)", call.arg("name")),
+            "remove_everything" => "Remove everything: NightCoop, RED4ext and the launch option".into(),
+            other => ai::TOOLS.iter().find(|t| t.0 == other).map(|t| t.1.to_string()).unwrap_or_else(|| other.replace('_', " ")),
+        }
     }
 
     fn settings_page(&mut self, ui: &mut egui::Ui) {
@@ -1979,9 +2765,13 @@ impl App {
         });
         let Some(c) = choice else { return };
         let which = self.confirm.take().unwrap();
-        if c == 0 {
-            return;
+        if c != 0 {
+            self.run_confirm(ctx, which, c);
         }
+    }
+
+    /// Carries out a confirmed action (1 = yes, 2 = the alternative button).
+    fn run_confirm(&mut self, ctx: &egui::Context, which: Confirm, c: u8) {
         let game = self.status.game.clone();
         match which {
             Confirm::Setup => self.start_setup(ctx, c == 1),
@@ -2144,7 +2934,9 @@ enum HostPlace {
 struct ServerUi {
     place: HostPlace,
     router: Option<RouterCheck>,
-    wsl: Option<WslStatus>,
+    hub: Option<HubStatus>,
+    /// The hub status was looked up once for this page.
+    checked: bool,
     /// `host#FINGERPRINT` of the player's own server.
     address: String,
     vps_host: String,
@@ -2172,13 +2964,14 @@ impl RouterCheck {
 }
 
 #[derive(Clone, Default)]
-struct WslStatus {
-    installed: bool,
-    distro: bool,
-    mirrored: bool,
-    firewall: bool,
+struct HubStatus {
     built: bool,
     running: bool,
+    /// Windows Firewall rule present (None elsewhere).
+    firewall: Option<bool>,
+    autostart: bool,
+    build_info: Option<String>,
+    update_available: bool,
     fingerprint: Option<String>,
     public_ip: Option<String>,
 }
@@ -2199,36 +2992,23 @@ fn router_check(open_ports: Option<bool>) -> RouterCheck {
     RouterCheck { router, public_ip, ports_opened }
 }
 
-#[cfg(windows)]
-fn wsl_status() -> WslStatus {
-    use hub::wsl;
-    let installed = wsl::distros().is_some();
-    let distro = installed && wsl::distro_ready();
-    let built = distro && wsl::hub_built();
-    let running = built && wsl::running();
-    WslStatus {
-        installed,
-        distro,
-        mirrored: wsl::mirrored(),
-        firewall: wsl::firewall_ok(),
+fn hub_status() -> HubStatus {
+    let built = hub::built();
+    let running = built && hub::running();
+    #[cfg(windows)]
+    let firewall = Some(hub::firewall::ok());
+    #[cfg(not(windows))]
+    let firewall = None;
+    HubStatus {
         built,
         running,
-        fingerprint: if built { wsl::fingerprint() } else { None },
+        firewall,
+        autostart: hub::autostart(),
+        build_info: hub::build_info(),
+        update_available: built && hub::latest_commit().map(|c| hub::update_available(&c)).unwrap_or(false),
+        fingerprint: hub::fingerprint(),
         public_ip: if running { net::public_ip().map(|ip| ip.to_string()) } else { None },
     }
-}
-
-#[cfg(not(windows))]
-#[allow(dead_code)]
-fn wsl_status() -> WslStatus {
-    WslStatus::default()
-}
-
-#[cfg_attr(not(windows), allow(dead_code))]
-fn computer_name() -> String {
-    let n = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "home".into());
-    let n: String = n.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(30).collect::<String>().to_ascii_lowercase();
-    if n.is_empty() { "home".into() } else { n }
 }
 
 /// One numbered step: status mark, title, detail and (when given) a button. Returns true when clicked.
@@ -2253,22 +3033,167 @@ fn step_row(ui: &mut egui::Ui, n: usize, done: Option<bool>, title: &str, detail
     clicked
 }
 
+#[derive(Default)]
+struct AiUi {
+    messages: Vec<ai::Message>,
+    input: String,
+    /// The answer being streamed, and the switch that stops it.
+    stream: Option<(Receiver<ai::Event>, Arc<AtomicBool>)>,
+    /// A running connection check: Ok((address, models)).
+    probe: Option<Receiver<Result<(String, Vec<String>), String>>>,
+    probed: bool,
+    test_asked: bool,
+    connection: Option<Result<String, String>>,
+    models: Vec<String>,
+    error: Option<String>,
+    notice: Option<String>,
+    /// Where tool results go back to the AI.
+    results: Option<mpsc::Sender<Vec<(String, String)>>>,
+    /// The AI's tool calls of the current step.
+    actions: Vec<AiAction>,
+    /// (action index, first log line) of the job an action started.
+    job: Option<(usize, usize)>,
+}
+
+struct AiAction {
+    call: ai::ToolCall,
+    label: String,
+    state: ActState,
+}
+
+enum ActState {
+    /// Waiting for the player's OK.
+    Ask,
+    Ready,
+    Running,
+    Done(String),
+    Declined,
+}
+
+fn router_summary(r: &RouterCheck) -> String {
+    let router = match &r.router {
+        Ok((name, local, ext)) => format!("Router: {name}, this computer {local}, router's public address {}", ext.map(|e| e.to_string()).unwrap_or_else(|| "?".into())),
+        Err(e) => format!("Router: not reachable by UPnP ({e})"),
+    };
+    format!(
+        "\n{router}\nPublic address (STUN): {}\nCGNAT (home hosting impossible): {}\nPorts forwarded now: {}",
+        r.public_ip.map(|i| i.to_string()).unwrap_or_else(|| "?".into()),
+        r.cgnat(),
+        r.ports_opened
+    )
+}
+
+fn hub_summary(h: &HubStatus) -> String {
+    format!(
+        "\nServer: built {} ({}) · running {} · firewall {} · starts with computer {} · update available {} · fingerprint {} · address {}",
+        h.built,
+        h.build_info.as_deref().unwrap_or("-"),
+        h.running,
+        h.firewall.map(|f| f.to_string()).unwrap_or_else(|| "n/a".into()),
+        h.autostart,
+        h.update_available,
+        h.fingerprint.as_deref().unwrap_or("-"),
+        match (&h.public_ip, &h.fingerprint) {
+            (Some(ip), Some(fp)) => format!("{ip}#{fp}"),
+            _ => "-".into(),
+        }
+    )
+}
+
+/// Just enough Markdown for chat answers: code blocks (with Copy), headings, bullets, `code` and **bold**.
+fn markdown(ui: &mut egui::Ui, text: &str) {
+    fn code_block(ui: &mut egui::Ui, code: &mut String) {
+        let block = code.trim_end().to_string();
+        code.clear();
+        if block.is_empty() {
+            return;
+        }
+        egui::Frame::new().fill(Color32::from_rgb(16, 16, 24)).corner_radius(6).inner_margin(8).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(&block).monospace().color(CYAN));
+                if ui.small_button("📋").on_hover_text("Copy").clicked() {
+                    ui.ctx().copy_text(block.clone());
+                }
+            });
+        });
+    }
+    let mut in_code = false;
+    let mut code = String::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_code {
+                code_block(ui, &mut code);
+            }
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            code.push_str(line);
+            code.push('\n');
+            continue;
+        }
+        let t = line.trim_end();
+        if t.trim().is_empty() {
+            ui.add_space(2.0);
+            continue;
+        }
+        let s = t.trim_start();
+        let (body, heading) = match s.strip_prefix('#') {
+            Some(h) => (h.trim_start_matches('#').trim().to_string(), true),
+            None => {
+                let indent = " ".repeat((t.len() - s.len()).min(6));
+                match s.strip_prefix("- ").or_else(|| s.strip_prefix("* ")) {
+                    Some(rest) => (format!("{indent}•  {rest}"), false),
+                    None => (t.to_string(), false),
+                }
+            }
+        };
+        let mut job = egui::text::LayoutJob::default();
+        for (i, seg) in body.split('`').enumerate() {
+            let rt = if i % 2 == 1 {
+                RichText::new(seg).monospace().color(CYAN)
+            } else {
+                let rt = RichText::new(seg.replace("**", ""));
+                if heading { rt.strong().color(ACCENT) } else { rt }
+            };
+            rt.append_to(&mut job, ui.style(), egui::FontSelection::Default, egui::Align::Center);
+        }
+        ui.label(job);
+    }
+    if in_code {
+        code_block(ui, &mut code);
+    }
+}
+
 fn fetch_remote(settings: &Settings) -> RemoteInfo {
     let repo = settings.helper_repo.trim();
-    let (red4ext, nightcoop, helper) = std::thread::scope(|sc| {
+    let (red4ext, nightcoop, helper, hub) = std::thread::scope(|sc| {
         let r4 = sc.spawn(|| remote::github_releases(remote::RED4EXT_REPO).map_err(|e| format!("{e:#}")));
         let nc = sc.spawn(|| remote::nightcoop_manifest(&settings.manifest_url).map_err(|e| format!("{e:#}")));
         let hp = sc.spawn(|| (!repo.is_empty()).then(|| selfupdate::check(repo).map_err(|e| format!("{e:#}"))));
+        let hb = sc.spawn(|| hub::built().then(|| hub::latest_commit().map_err(|e| format!("{e:#}"))));
         let failed = "the check stopped unexpectedly".to_string();
-        (Some(r4.join().unwrap_or_else(|_| Err(failed.clone()))), Some(nc.join().unwrap_or_else(|_| Err(failed))), hp.join().unwrap_or(None))
+        (
+            Some(r4.join().unwrap_or_else(|_| Err(failed.clone()))),
+            Some(nc.join().unwrap_or_else(|_| Err(failed))),
+            hp.join().unwrap_or(None),
+            hb.join().unwrap_or(None),
+        )
     });
-    RemoteInfo { red4ext, nightcoop, helper, checked_at: Some(chrono::Local::now().format("%Y-%m-%d %H:%M").to_string()) }
+    RemoteInfo { red4ext, nightcoop, helper, hub, checked_at: Some(chrono::Local::now().format("%Y-%m-%d %H:%M").to_string()) }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_job(&ctx);
+        self.poll_ai();
+        self.ai_drive(&ctx);
+        if self.hub_update_due && !self.busy() {
+            self.hub_update_due = false;
+            self.log.push("A newer NightCoop hub is out; updating your server.".into());
+            self.server_action(&ctx, "update");
+        }
         // Keep "Steam/game running" fresh without hammering the process list.
         if !self.busy() && self.last_poll.elapsed() > Duration::from_secs(4) {
             self.last_poll = Instant::now();
@@ -2293,6 +3218,7 @@ impl eframe::App for App {
                     Page::Together => self.together(ui),
                     Page::Server => self.server_page(ui),
                     Page::Troubleshoot => self.troubleshoot(ui),
+                    Page::Ai => self.ai_page(ui),
                     Page::Guide => self.guide(ui),
                     Page::Settings => self.settings_page(ui),
                 });
@@ -2416,5 +3342,37 @@ mod tests {
         let one_line = compare_versions(mine, "Invite: QX72KD@hub.example.org#K3QF-9X2M  My versions: NightCoop 0.1.0-beta.1 · Protocol 128");
         assert_eq!(one_line[0].2.as_deref(), Some("0.1.0-beta.1"));
         assert!(compare_versions(mine, "open NightCoop Helper and Play together")[0].2.is_none());
+    }
+
+    /// The whole agent loop inside the real app: the model calls tools, the app runs them (changes are
+    /// declined here), results go back. Needs a model: NCH_AI_URL=http://localhost:11434/v1
+    #[test]
+    #[ignore]
+    fn live_agent_in_app() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        app.settings.ai_url = std::env::var("NCH_AI_URL").unwrap_or_else(|_| ai::DEFAULT_URL.into());
+        app.settings.ai_auto_approve = false;
+        app.ai.input = "Check for updates, then tell me whether a newer NightCoop build is out than the one I have.".into();
+        app.ai_send(&ctx);
+        let start = Instant::now();
+        while (app.ai.stream.is_some() || app.busy()) && start.elapsed() < Duration::from_secs(400) {
+            app.poll_job(&ctx);
+            app.poll_ai();
+            for a in &mut app.ai.actions {
+                if matches!(a.state, ActState::Ask) {
+                    println!("declining: {}", a.label);
+                    a.state = ActState::Declined;
+                }
+            }
+            app.ai_drive(&ctx);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for m in &app.ai.messages {
+            println!("[{}] {}", m.role, m.content);
+        }
+        assert!(app.ai.error.is_none(), "{:?}", app.ai.error);
+        assert!(app.ai.messages.iter().any(|m| m.role == "tool"), "the AI used a tool");
+        assert!(app.ai.messages.last().is_some_and(|m| m.role == "assistant"), "and answered after it");
     }
 }

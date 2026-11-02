@@ -32,7 +32,7 @@ Getting a RED4ext mod running on the Steam Deck normally means Desktop Mode, dig
 | | Step | What happens |
 |---|---|---|
 | 💾 | **Backs up your saves** | Zips your saves first (on the Deck it finds them inside the Proton prefix). |
-| 🌃 | **Installs NightCoop** | Latest build from the official release list on nightcoop.net, checksum-verified. |
+| 🌃 | **Installs NightCoop** | Latest build from the official release list on nightcoop.net, checksum-verified — the zip made for **your** game version when a release ships several. |
 | 🧩 | **Sets up RED4ext** | Uses the RED4ext that ships inside the NightCoop build (the pair its authors tested). GitHub is only a fallback. |
 | 🐧 | **Fixes Proton** *(Deck/Linux)* | Adds `WINEDLLOVERRIDES="winmm,version=n,b" %command%` to Steam's launch options (keeping anything you already had) and installs Microsoft's **Visual C++ runtime** into the game's Proton files — without it RED4ext fails with "error 998". |
 | ✅ | **Checks it all** | Green ticks when everything is ready to play. |
@@ -41,7 +41,8 @@ Press the same button again whenever an update is out — it only replaces what 
 
 ### And a lot more
 
-- 🔄 **Update checks** for NightCoop (stable or beta channel), RED4ext and the helper itself
+- 💬 **AI helper** — connect your own local AI (Ollama, LM Studio…) and just ask. It knows the mod and this app, reads your status and logs, and can **do the work for you**: install, update, switch builds, fix the Deck's runtime, test your connection, set up your server — each change shown for your OK first
+- 🔄 **Update checks** for NightCoop (stable or beta channel), RED4ext, the helper itself and your own server
 - 📦 **Version picker** — install any listed NightCoop build, with notes, supported game versions, protocol and build numbers
 - 🧩 **RED4ext your way** — *Bundled with NightCoop* (default, kept matched on every update) or *My own version* (pick any RED4ext release; updates never override it)
 - ✅ **Game-version check** — shows whether the installed build supports your Cyberpunk version
@@ -62,9 +63,10 @@ Press the same button again whenever an update is out — it only replaces what 
 - 🖐 Big, touch-friendly UI sized for the Deck's 1280×800 screen, adjustable scale
 
 <div align="center">
-<img src="docs/screenshots/together.png" alt="Play together page" width="32%">
-<img src="docs/screenshots/mods.png" alt="Mods and versions page" width="32%">
-<img src="docs/screenshots/host.png" alt="Host a server page" width="32%">
+<img src="docs/screenshots/together.png" alt="Play together page" width="24%">
+<img src="docs/screenshots/mods.png" alt="Mods and versions page" width="24%">
+<img src="docs/screenshots/host.png" alt="Host a server page" width="24%">
+<img src="docs/screenshots/ai.png" alt="AI helper page" width="24%">
 </div>
 
 ---
@@ -102,6 +104,18 @@ Press **🔌 Mods off** on the Home page. RED4ext and NightCoop are moved aside,
 - **Backups are your undo button**: Steam Cloud also syncs mistakes. The helper backs up saves before every install, keeps the newest 10, and can restore any of them (your current saves are backed up first).
 - **Extra copy**: on the Saves page, pick a second folder — the SD card, a USB stick, or a folder synced by Dropbox / OneDrive / Google Drive / Syncthing — and every backup is copied there too. **Export…** saves any single backup wherever you like.
 
+## 💬 AI helper (optional)
+
+Like having a friend who knows the mod sitting next to you — and it runs on **your own computer**, free and private.
+
+1. Install [Ollama](https://ollama.com) or [LM Studio](https://lmstudio.ai) on a PC.
+2. Download a model that can use tools, e.g. `ollama pull qwen2.5:7b` or `ollama pull llama3.1:8b` (on a weak laptop: `llama3.2:3b`). In LM Studio, download one and start its server.
+3. Open **💬 AI helper** and press **Find my AI**.
+
+It gets a rundown of NightCoop and of every page of this app, plus your status checks (account names and your home folder hidden). Ask things like *"there's no Co-op menu, fix it"* or *"set up a server on this PC"* — it looks at your setup, explains what it's going to do, and uses the helper's own functions. Anything that changes something shows an **Allow / Decline** card (or tick *Let the AI act without asking*); uninstalling and restoring saves always ask.
+
+**On a Steam Deck:** use the AI on your PC. On the PC, LM Studio → *Serve on local network*, or set `OLLAMA_HOST=0.0.0.0` for Ollama; then enter `http://<PC's address>:11434/v1` (LM Studio: port 1234) in the helper.
+
 ## 🤝 Playing together
 
 Open **👥 Play together** in the helper — it walks you through it:
@@ -123,11 +137,11 @@ The helper's **🖥 Host a server** page sets one up three ways:
 
 | Where | What the helper does |
 |---|---|
-| **This Windows PC** (WSL2) | One button per step: installs WSL + Ubuntu 24.04, switches WSL to mirrored networking, opens Windows' and WSL's firewall, builds the official hub inside Ubuntu, then **Start / Stop**. Shows your fingerprint and backs up the hub's key. |
+| **This computer** (Windows or Linux) | **Build** downloads the [official hub source](https://github.com/Twenfys/nightcoop-hub) and a portable compiler (zig, ~100 MB once, checksum-verified) and builds the hub right there — no WSL, no virtual machine, no installer. Then **Open ports** (Windows Firewall, one admin prompt), **Start / Stop**, *start with the computer*, and **automatic updates** whenever the official source changes. Shows your fingerprint; the key is backed up so it never changes. |
 | **A cheap Linux VPS** (~$5/month) | Step-by-step guide, then **one command** — or a button that opens SSH and runs it for you. |
-| **Another Linux PC** | The same one command. |
+| **Another Linux PC** | Copy the helper there and use *This computer*, or the same one command (installs a system service). |
 
-For a home server it also **checks your router** (UPnP): finds this PC's address, tells you if your provider uses CGNAT (then a home server can't work — use a VPS), and can **open the ports automatically** — UDP **47800** and **47810–47811**. A **Use this server in my game** button points your game at it; your partner just pastes your invite as usual.
+For a home server it also **checks your router** (UPnP): finds this PC's address, tells you if your provider uses CGNAT (then a home server can't work — use a VPS), and can **open the ports automatically** — UDP **47800** and **47810–47811**. A **Use this server in my game** button points your game at it; your partner just pastes your invite as usual. The AI helper can do all of these steps for you too.
 
 **The one command** (Ubuntu 24.04+ / Debian 13+, follows the [official guide](https://github.com/Twenfys/nightcoop-hub/blob/HEAD/tools/hub/docker/README.md) without Docker):
 
@@ -184,6 +198,7 @@ That happens in Gaming Mode. Switch to Desktop Mode and press the button again, 
 | What | Where |
 |---|---|
 | Helper settings, save backups, rollbacks, downloads | `NightCoopHelper-data/` next to the helper — move them together |
+| Your own server (hub, its key, the compiler) | `NightCoopHelper-data/hub/`, `…/tools/`; key backup in `…/backups/hub-sign.key` |
 | Mods while switched off | `<game>/_NightCoopHelper_mods_off/` |
 | RED4ext | `<game>/bin/x64/winmm.dll`, `<game>/red4ext/` |
 | NightCoop | `<game>/red4ext/plugins/NightCoop/` (disabled: `<game>/red4ext/NightCoop.disabled/`) |
@@ -194,7 +209,8 @@ That happens in Gaming Mode. Switch to Desktop Mode and press the button again, 
 
 ## 🔒 Safety
 
-- Downloads come only from `github.com/WopsS/RED4ext` and `nightcoop.net`, and are **SHA-256 verified** when the source publishes a checksum.
+- Downloads come only from `github.com/WopsS/RED4ext`, `nightcoop.net`, Microsoft (the Visual C++ runtime) and — for hosting a server — the official hub source on GitHub plus the zig compiler from PyPI, and are **SHA-256 verified** whenever a checksum is published (zig always).
+- The AI helper only talks to the address you enter, and every change it makes asks you first unless you allow otherwise.
 - Saves are backed up before every install; Steam's config is backed up before every edit.
 - The previous NightCoop build is kept for rollback, and "Mods off" only moves files — it never deletes them.
 - Everything is open source in this repo — see [`src/`](src).

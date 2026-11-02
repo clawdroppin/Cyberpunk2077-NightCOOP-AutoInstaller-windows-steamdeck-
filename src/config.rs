@@ -69,6 +69,18 @@ pub struct Settings {
     /// GitHub "owner/repo" where releases of this helper are published, for self-update.
     pub helper_repo: String,
     pub manifest_url: String,
+    /// OpenAI-compatible address of the player's own AI (Ollama, LM Studio…) for the AI helper page.
+    pub ai_url: String,
+    /// Empty = the first model the server lists.
+    pub ai_model: String,
+    /// Only for servers that ask for one; most local ones don't.
+    pub ai_key: String,
+    /// Send the helper's diagnostics (versions, paths with the home folder hidden, log summary) along with questions.
+    pub ai_share_status: bool,
+    /// Let the AI run actions without asking each time (risky ones always ask).
+    pub ai_auto_approve: bool,
+    /// Rebuild a hub hosted on this computer when the official source changes.
+    pub hub_auto_update: bool,
 }
 
 impl Default for Settings {
@@ -83,6 +95,12 @@ impl Default for Settings {
             backup_mirror: String::new(),
             helper_repo: crate::selfupdate::HOME_REPO.to_string(),
             manifest_url: crate::remote::NIGHTCOOP_MANIFEST.to_string(),
+            ai_url: crate::ai::DEFAULT_URL.to_string(),
+            ai_model: String::new(),
+            ai_key: String::new(),
+            ai_share_status: true,
+            ai_auto_approve: false,
+            hub_auto_update: true,
         }
     }
 }

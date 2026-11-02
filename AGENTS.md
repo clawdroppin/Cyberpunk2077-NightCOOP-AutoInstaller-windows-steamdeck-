@@ -24,8 +24,9 @@ one-button flow working without a terminal.
 
 | File | Responsibility |
 |---|---|
-| `src/main.rs` | Window setup (maximized on Deck), module list. |
-| `src/app.rs` | All GUI pages, the job runner (one background thread at a time), confirm modals, styling. |
+| `src/main.rs` | Window setup (maximized on Deck), module list. `--start-hub` starts the player's hub and exits (autostart). |
+| `src/app.rs` | All GUI pages, the job runner (one background thread at a time), confirm modals (`run_confirm`), styling, and the AI agent glue: `ai_tool` maps each tool to the same code the buttons use, `ai_drive` runs approved calls one at a time and returns results. |
+| `src/ai.rs` | Optional AI helper over the OpenAI-compatible API (Ollama, LM Studio, llama.cpp, Jan): model list, local server discovery, streaming chat with **tool calls** (`TOOLS`: name, description, params, `Risk::Look/Change/Always`), the knowledge prompt and agent rules. Falls back to plain chat for models without tool support. |
 | `src/ops.rs` | Long-running operations: install/uninstall RED4ext & NightCoop, rollback, mods off/on (parking), save backup/restore/mirror, launch options, bug report. Has the integration test. |
 | `src/game.rs` | Finding the game (Steam / GOG / Epic / manual) and `Status::scan` (what's installed, versions, saves, Proton, logs). |
 | `src/steam.rs` | Steam roots & libraries, `appmanifest`, launch-option merge/strip, process detection, Steam shutdown/start, Deck detection. |
@@ -33,8 +34,8 @@ one-button flow working without a terminal.
 | `src/invite.rs` | Finds NightCoop invites (`CODE@host[:port]#FINGERPRINT` or a bare code) in pasted text; builds the "message for my partner". |
 | `src/net.rs` | Connection check: resolves `hub.nightcoop.net`, STUN binding requests to the public servers the mod uses → UDP works? strict NAT? `public_ip()`. |
 | `src/upnp.rs` | UPnP IGD client (SSDP + SOAP, no deps): router discovery, external address (CGNAT check), add/remove UDP port mappings. |
-| `src/hub.rs` | Self-hosted hub: embeds `scripts/nightcoop-hub-setup.sh`, address parsing (`host#FINGERPRINT`), `hub.txt` "use in my game", SSH launcher for a VPS, and `hub::wsl` (Windows): WSL/Ubuntu install, mirrored networking (`.wslconfig`), firewall (Windows + Hyper-V rules, elevated via one UAC prompt), build, start/stop, fingerprint, key backup/restore. |
-| `scripts/nightcoop-hub-setup.sh` | One-command hub setup for Ubuntu 24.04+/Debian 13+ (VPS, Linux PC, WSL with `--no-service`). Builds the official hub source (ENet commit read from the official guide), systemd service, ufw, sysctl, prints `NIGHTCOOP_HUB_ADDRESS=ip#fp`. Served from this repo's `main` branch — keep the path stable. |
+| `src/hub.rs` | Self-hosted hub: address parsing (`host#FINGERPRINT`), `hub.txt` "use in my game", SSH launcher for a VPS, and the **native hub**: downloads zig (PyPI wheel, pinned SHA-256) + the official source + ENet, compiles it on the player's PC (Windows or Linux), smoke-tests it, start/stop (detached, log in `logs/hub.log`), fingerprint, key backup, autostart (HKCU Run / XDG autostart), update check against the source's latest commit, Windows Firewall rule (one UAC prompt). |
+| `scripts/nightcoop-hub-setup.sh` | One-command hub setup for Ubuntu 24.04+/Debian 13+ (VPS or Linux PC as a systemd service; `--no-service` for a manual run). Builds the official hub source (ENet commit read from the official guide), systemd service, ufw, sysctl, prints `NIGHTCOOP_HUB_ADDRESS=ip#fp`. Served from this repo's `main` branch — keep the path stable. |
 | `src/vdf.rs` | Text KeyValues parser/writer that preserves raw escaping (round-trips Steam files). |
 | `src/shortcuts.rs` | Binary `shortcuts.vdf` reader/writer for "Add to Steam". |
 | `src/selfupdate.rs` | Helper self-update from this repo's GitHub releases. `HOME_REPO` lives here. |
@@ -52,7 +53,10 @@ one-button flow working without a terminal.
   Players join with an invite code (`CODE@host#fingerprint`), relay hub on UDP 47800.
 - **Release feed** `https://nightcoop.net/releases.json` (written by the site's `server/releases.py`):
   `{schema, updated, latest, releases:[{version, channel:"stable"|"beta", yanked:false|{reason}, date,
-  title, notes, game:[...], protocol, files:[{kind:"mod"|"hub-src", url, size, sha256, mirrors:[]}]}]}`.
+  title, notes, game:[...], protocol, files:[{kind:"mod"|"hub-src", url, size, sha256, mirrors:[], game?:[...], red4ext?}]}]}`.
+  **Since 0.1.2-beta a release may ship one `mod` file per game version** (`files[].game`, plus the bundled `red4ext` version):
+  `NcRelease::mod_file_for(exe version)` picks the matching one and returns `None` rather than a wrong file; "Install
+  everything" reinstalls when the installed zip's SHA-256 isn't the one for the current game version (the game was updated).
   Text fields may be a string or `{"en","ru"}`. URLs may be relative to the manifest. Parsing is lenient on purpose.
 - **RED4ext** zip layout: `bin/x64/winmm.dll` + `red4ext/RED4ext.dll` (+ licenses). GitHub assets carry a
   `digest: "sha256:…"` which we verify. Symbols zip is skipped.
@@ -81,7 +85,8 @@ one-button flow working without a terminal.
 cargo test                      # unit + fake-game install cycle (no network)
 cargo test -- --include-ignored # also installs real RED4ext and the live NightCoop build into temp folders
 cargo run                       # debug GUI
-$env:NCH_PAGE="versions"; cargo run   # open a page directly: home, play (together), versions, saves, host (server), troubleshoot, guide, settings
+$env:NCH_PAGE="versions"; cargo run   # open a page directly: home, play (together), versions, saves, host (server), troubleshoot, ai, guide, settings
+$env:NCH_AI_ASK="question"            # with NCH_PAGE="ai": sends the question once the AI is connected (testing)
 .\build.ps1                     # full release build into dist\
 ```
 
@@ -137,19 +142,36 @@ print([t.needed for s in f.iter_sections() if s.name == ".dynamic" for t in s.it
   Copy button and Ctrl+V silently does nothing — this shipped broken in 0.1.0–0.3.1.
 
 `cargo test -- --include-ignored` runs `real_nightcoop_install`, which installs the live latest build into a temp folder.
+Live tests that need more: `real_native_hub` (downloads zig ~100 MB, builds and runs the hub, ~80 s), and with a model
+running (`NCH_AI_URL=http://localhost:11434/v1`) `live_chat`, `live_tools` and `live_agent_in_app` (the whole agent loop in
+the real `App`, headless; changes are declined).
+
+### 0.1.2-beta (verified 2026-11-02)
+
+- `protocol: 143` (0.1.0/0.1.1 were 128 — they can't play together), `build: "bacb705"`, notes are a list per language.
+- Two `mod` files: `NightCoop-0.1.2-beta-2.5.zip` (`game: ["2.5"]`, `red4ext: "1.31.0"`) and `…-2.31.zip` (`game: ["2.31"]`,
+  `red4ext: "1.30.0"`). Same zip layout as before.
 
 ## Self-hosted hub facts
 
 - Hub CLI (official): `nightcoop_hub <port> --shards N --max-clients 512 --sign-key-auto <key> --hub-name X --region Y`;
-  thread ports are `port+10 … port+10+N-1`; `--hub-public <key>` prints `# fingerprint XXXX-XXXX-XXXX-XXXX`. The key is created
-  on first start (mode 0600) and is the server's identity — the helper backs it up from WSL and restores it after a reinstall.
-- Home/WSL uses `--shards 2` → UDP 47800, 47810, 47811. A VPS uses `auto` (one thread per core).
-- WSL2 needs **mirrored networking** so the hub sees players' real addresses and forwarded ports reach it, plus a **Hyper-V
-  firewall** rule (VMCreatorId `{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}`) besides the normal Windows Firewall rule.
+  thread ports are `port+10 … port+10+N-1`; `--hub-public <key>` prints `# fingerprint XXXX-XXXX-XXXX-XXXX`;
+  `--gen-sign-key <file>` makes a key. The key is the server's identity — the helper keeps it in `data/hub/` and a copy in
+  `data/backups/hub-sign.key`, restored on rebuild.
+- **The source builds natively on Windows** (it has `_WIN32` paths: `windows.h`, `bcrypt`, `io.h`). Recipe = the official
+  Dockerfile's: ENet (commit from `ARG ENET_COMMIT=` in `tools/hub/docker/Dockerfile`, fallback `5a9c537…`) as C files
+  (`win32.c` on Windows, `unix.c` + the `HAS_*` defines on Linux), `monocypher.c`, then `src/Log.cpp src/NetCrypto.cpp
+  src/HubServer.cpp tools/hub/main.cpp` with `-std=c++20 -O2`; link `-lws2_32 -lwinmm -lbcrypt` (Windows) or `-pthread`.
+  zig 0.16.0 (`zig cc` / `zig c++`, target `x86_64-windows-gnu`) — verified 2026-11-02: builds, `--gen-sign-key`/`--hub-public`
+  work, listens on the entry and thread ports. Caches go to `data/tools/zig-cache` (portable). The hub repo has no licence
+  file, so the helper builds on the player's machine instead of redistributing binaries.
+- GitHub source zips carry the commit SHA as the zip comment; `hub/commit.txt` stores it, and `hub::latest_commit()` (API,
+  `Accept: application/vnd.github.sha`) drives the update check (`Settings.hub_auto_update`: rebuild + restart automatically).
+- Home hubs use `--shards 2` → UDP 47800, 47810, 47811. A VPS uses `auto` (one thread per core).
 - The game is pointed at a server by writing `address#fingerprint` to `hub.txt` next to `NightCoop.dll` (the mod moves it into
-  its own servers on the next start — documented in the official hub guide).
-- The script's build steps were verified by cross-compiling the official source with zig (`x86_64-linux-gnu`); the full script,
-  the WSL steps and the UPnP port mapping have **not** been run end-to-end yet (no Linux box / WSL on the dev PC; router left alone).
+  its own servers on the next start — documented in the official hub guide). While mods are off, that's the parked folder.
+- Not run end-to-end yet: the VPS script on a fresh VPS, UPnP add/remove on a real router, the Linux native build (same recipe
+  as the verified Linux cross-compile), a player connecting to a home hub from outside.
 
 ## Open items
 
@@ -158,12 +180,22 @@ print([t.needed for s in f.iter_sections() if s.name == ".dynamic" for t in s.it
 - [ ] "Add to Steam" shortcut appears in Gaming Mode and launches.
 - [ ] File picker (xdg-desktop-portal) works in Desktop Mode.
 - [ ] NightCoop officially supports Windows 10/11 only; collect Deck/Proton reports.
-- [ ] Host a server: run the WSL path end-to-end on a real PC (install, first start without OOBE, mirrored mode, firewall, build,
-      start, reachable from outside), the setup script on a fresh Ubuntu 24.04 VPS, and UPnP add/remove on a real router.
+- [ ] Host a server: a partner joins a home hub from outside (firewall + router), the native build on Linux, the setup script on
+      a fresh Ubuntu 24.04 VPS, and UPnP add/remove on a real router.
+- [ ] AI helper: try more models (qwen2.5:7b, llama3.1:8b) for tool use; gemma4:12b was verified on CPU.
 - Ideas: Windows exe/window icon, Proton version recommendation, detect Heroic/Lutris installs on Linux,
   controller-friendly focus navigation for Gaming Mode, identify manually installed builds by hashing the DLL inside cached zips.
 
 ## Changelog
+
+- **0.6.0** — **AI helper** page: connect a local AI (Ollama, LM Studio, llama.cpp, Jan; "Find my AI"; Deck → PC on the LAN).
+  It gets a rundown of NightCoop and the app, the player's diagnostics, and 32 tools covering every page (status, logs,
+  updates, install/switch builds, mods off/on, saves, VC++ runtime, launch option, connection/router checks, the whole server
+  setup); changes need an Allow click unless "act without asking" is on, destructive ones always ask. **Native hub** on
+  Windows and Linux replaces WSL: one-button build from the official source with a downloaded compiler, firewall, start/stop,
+  start with the computer, automatic updates when the source changes. **NightCoop 0.1.2-beta support**: per-game-version
+  downloads, reinstall when the game version changes. Fixes: servers.txt, "Use this server" and bug-report logs while mods
+  are off; downloads cut off mid-way without a checksum were accepted; "2.3" counted as covering game "2.31".
 
 - **0.5.0** — **Host a server** page: WSL2 automation on Windows (install, mirrored networking, firewall, build, start/stop,
   fingerprint, key backup), VPS guide + one-command setup script (`scripts/nightcoop-hub-setup.sh`) with an SSH launcher,

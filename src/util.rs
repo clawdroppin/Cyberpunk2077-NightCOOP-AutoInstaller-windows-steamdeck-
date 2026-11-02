@@ -59,6 +59,11 @@ pub fn download(url: &str, dest: &Path, sha256: Option<&str>, progress: &mut dyn
     }
     file.flush()?;
     drop(file);
+    // Without a checksum, a dropped connection would otherwise pass as a complete file.
+    if total.is_some_and(|t| t != done) {
+        let _ = fs::remove_file(&part);
+        bail!("the download of {url} was cut off ({done} of {} bytes). Try again.", total.unwrap_or_default());
+    }
     if let Some(want) = sha256 {
         let got = hex::encode(hasher.finalize());
         if !got.eq_ignore_ascii_case(want) {
@@ -251,7 +256,9 @@ pub fn version_covers(entry: &str, game: &str) -> bool {
         return false;
     }
     let n = e.len().min(g.len());
-    e[..n] == g[..n] || game.trim().starts_with(entry.trim())
+    // "2.3" must not cover "2.31": a prefix only counts when no digit follows it.
+    let (entry, game) = (entry.trim(), game.trim());
+    e[..n] == g[..n] || game.strip_prefix(entry).is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
 }
 
 /// Reads the FileVersion / ProductVersion of a Windows PE file (works on any OS).
@@ -332,6 +339,7 @@ mod tests {
         assert!(!same_version("0.1.0", "0.1.0-beta.1"));
         assert!(version_covers("2.3", "2.3.1"));
         assert!(version_covers("2.31", "2.31"));
+        assert!(!version_covers("2.3", "2.31") && !version_covers("2.31", "2.3"));
         assert!(!version_covers("2.3", "2.5"));
         assert!(!version_covers("", "2.5"));
     }

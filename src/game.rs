@@ -111,8 +111,16 @@ impl Game {
     pub fn park_dir(&self) -> PathBuf {
         self.dir.join("_NightCoopHelper_mods_off")
     }
+    /// The RED4ext folder where it is right now: parked while mods are off.
+    pub fn active_red4ext_dir(&self) -> PathBuf {
+        let parked = self.park_dir().join("red4ext");
+        if parked.is_dir() && !self.red4ext_dir().exists() { parked } else { self.red4ext_dir() }
+    }
+    pub fn active_plugin_dir(&self) -> PathBuf {
+        self.active_red4ext_dir().join("plugins").join("NightCoop")
+    }
     pub fn servers_file(&self) -> PathBuf {
-        self.plugin_dir().join("servers.txt")
+        self.active_plugin_dir().join("servers.txt")
     }
     /// Running through Proton (Linux) rather than natively on Windows.
     pub fn uses_proton(&self) -> bool {
